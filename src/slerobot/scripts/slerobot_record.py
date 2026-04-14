@@ -28,7 +28,7 @@ class DatasetRecordConfig:
         repo_id: Dataset identifier
         single_task: Short description of the task
         root_dir: Root directory where the dataset will be stored
-        fps: Limit the frames per second (default: 30)
+        fps: Limit the frames per second (default: 20)
         episode_time_s: Number of seconds of data recording per episode (default: 60)
         reset_time_s: Number of seconds of resetting the environment after each episode (default: 60)
         num_episodes: Number of episodes to record (default: 50)
@@ -47,7 +47,7 @@ class DatasetRecordConfig:
     repo_id: str
     single_task: str
     root: str | None = None
-    fps: int = 30
+    fps: int = 20
     episode_time_s: int | float = 60
     reset_time_s: int | float = 60
     num_episodes: int = 50
@@ -82,14 +82,14 @@ class FanucConfig:
         term_type: Termination type (default: "CNT")
         term_value: Termination value (default: 100)
         cameras: Dictionary of camera configurations (default: None)
-            Example: {"front": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30}}
+            Example: {"front": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 20}}
     """
-    host: str = "192.168.1.100"
+    host: str = "172.30.109.22"
     port: int = 16001
     group: int = 1
     utool: int = 1
     uframe: int = 0
-    speed: int = 150
+    speed: int = 250
     term_type: str = "CNT"
     term_value: int = 100
     cameras: dict[str, Any] | None = None
@@ -190,85 +190,212 @@ class RecordConfig:
 
 
 def record_loop(
-    robot:Robot,
-    events:dict,
-    fps:int,
-    dataset:sLerobotDataset | None=None,
-    teleop: Teleoperator | None=None,
-    policy: None=None,
+    robot: Robot,
+    events: dict,
+    fps: int,
+    dataset: sLerobotDataset | None = None,
+    teleop: Teleoperator | None = None,
+    policy: None = None,
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
     display_compressed_images: bool = False,
+    robot_speed: int | None = None,
+    robot_term_type: str | None = None,
+    robot_term_value: int | None = None,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
 
+    BUFFER_SIZE = 4
+    MIN_DIST_MM = 0.5
+    INTER_PACKET_DELAY = 0.002
+
+    pending: set = set()
+    last_sent_pose = None
+
     no_action_count = 0
-    timestamp = 0
-    start_episode_t = time.perf_counter()
-    while timestamp < control_time_s:
+    timestamp = 0.0
+    start_episode_t = time.perf_counter() if policy is not None else None
+    episode_started = policy is not None
+
+    action_sent_count = 0
+    action_skipped_buffer_full = 0
+    action_skipped_no_action = 0
+    action_skipped_spatial_filter = 0
+    last_diagnostic_time = time.perf_counter()
+    diagnostic_interval_s = 1.0
+
+    sample_period_s = 1.0 / fps
+    next_sample_t: float | None = None
+
+    _baseline_printed = False
+    _waiting_for_first_action_logged = False
+
+    def _advance_sample_deadline(now_t: float) -> None:
+        nonlocal next_sample_t
+        if next_sample_t is None:
+            return
+        next_sample_t += sample_period_s
+        while next_sample_t <= now_t:
+            next_sample_t += sample_period_s
+
+    while True:
         start_loop_t = time.perf_counter()
+
+        if episode_started and control_time_s is not None and timestamp >= control_time_s:
+            break
 
         if events["exit_early"]:
             events["exit_early"] = False
             break
 
-        # 1. get observation
-        obs = robot.get_observation()
-        # get processed observation [pass]
-        obs = obs
-        if policy is not None or dataset is not None:
-            observation_frame = build_dataset_frame(dataset.features, obs, prefix = OBS_STR)
-        
-        # 2. get action from teleop or policy
+        if episode_started:
+            if next_sample_t is None and start_episode_t is not None:
+                next_sample_t = start_episode_t
+            if next_sample_t is not None:
+                now_t = time.perf_counter()
+                if now_t < next_sample_t:
+                    precise_sleep(next_sample_t - now_t)
+
+        while True:
+            seq_id, err = robot.check_ack()
+            if seq_id is None:
+                break
+            pending.discard(seq_id)
+
+        # Buffer 满时跳帧
+        if len(pending) >= BUFFER_SIZE:
+            time.sleep(0.001)
+            action_skipped_buffer_full += 1
+            if episode_started:
+                _advance_sample_deadline(time.perf_counter())
+            continue
+
         if policy is not None:
-            action = policy.predict(obs) # TODO:[pass]
-            # process policy action [pass]
+            obs = robot.get_observation()
+            action = policy.predict(obs)
             policy_action = action
-        
+            action_to_save = policy_action
+            observation_frame = {}
+            if dataset is not None:
+                observation_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
+
         elif teleop is not None:
-            act = teleop.get_action()
-            # If no new action from teleop, skip this frame
-            if act is None:
+            action = teleop.get_action()
+
+            if not _baseline_printed:
+                _baseline_printed = True
+
+            if action is None:
+                time.sleep(0.001)
+                if not episode_started:
+                    if not _waiting_for_first_action_logged:
+                        _waiting_for_first_action_logged = True
+                else:
+                    action_skipped_no_action += 1
+                    # if action_skipped_no_action % 50 == 0:
+                    #     logging.warning(
+                    #         f"[NO_ACTION] 已连续跳过 {action_skipped_no_action} 帧（无 MQTT 数据），"
+                    #         f"累计耗时 {timestamp:.1f}s。请检查 Quest3s 是否在发送数据。"
+                    #     )
+                    _advance_sample_deadline(time.perf_counter())
                 continue
-            # Convert Quest3s format to Fanuc format
-            teleop_action = convert_quest3s_to_fanuc_action(act)
-        
+
+            if not episode_started:
+                start_episode_t = time.perf_counter()
+                timestamp = 0.0
+                episode_started = True
+                last_diagnostic_time = start_episode_t
+                next_sample_t = start_episode_t
+                # logging.info("[START] 收到首个 teleop action，开始记录 episode 时间与诊断统计。")
+
+            target_pose = (
+                action["position"]["x"],
+                action["position"]["y"],
+                action["position"]["z"],
+                action["rotation"]["w"],
+                action["rotation"]["p"],
+                action["rotation"]["r"],
+            )
+
+            if last_sent_pose is not None:
+                dx = target_pose[0] - last_sent_pose[0]
+                dy = target_pose[1] - last_sent_pose[1]
+                dz = target_pose[2] - last_sent_pose[2]
+                dist = (dx**2 + dy**2 + dz**2) ** 0.5
+                if dist < MIN_DIST_MM:
+                    time.sleep(0.001)
+                    action_skipped_spatial_filter += 1
+                    # if action_skipped_spatial_filter % 100 == 0:
+                    #     logging.warning(
+                    #         f"[SPATIAL_FILTER] 已跳过 {action_skipped_spatial_filter} 帧（dist={dist:.4f}mm < {MIN_DIST_MM}mm）。"
+                    #         f"机器人静止或 MIN_DIST_MM 设置过大？"
+                    #     )
+                    _advance_sample_deadline(time.perf_counter())
+                    continue
+
+            teleop_action = {
+                "position": target_pose,
+                "speed": robot_speed,
+                "term_type": robot_term_type,
+                "term_value": robot_term_value,
+            }
+            action_to_save = {
+                "j0": target_pose[0], "j1": target_pose[1], "j2": target_pose[2],
+                "j3": target_pose[3], "j4": target_pose[4], "j5": target_pose[5],
+            }
+            last_sent_pose = target_pose
+            observation_frame = {}
+
         else:
             no_action_count += 1
             if no_action_count == 1 or no_action_count % 10000 == 0:
-                logging.warning(
-                    "No policy or teleoperator provided, skipping action generation. "
-                    "This is likely to happen when resetting the environment without a teleop device. "
-                    "The robot won't be at its rest position at the start of the next episode."
-                )
+                logging.warning("No policy or teleoperator provided, skipping action generation.")
+            time.sleep(0.001)
             continue
-        
-        # 3. send action, applying a pipeline to the action , default is IdentityProcessor
-        action_to_send = policy_action if policy is not None else teleop_action
-        _sent_action = robot.send_action(action_to_send)
 
-        # 4. save to dataset
-        if dataset is not None: 
-            action_frame = build_dataset_frame(dataset.features, action_to_send, prefix=ACTION)
+        # send_action
+        action_to_send = policy_action if policy is not None else teleop_action
+        robot.send_action(action_to_send)
+
+        seq_id = robot.seq_id - 1
+        pending.add(seq_id)
+
+        action_sent_count += 1
+
+        if len(pending) >= BUFFER_SIZE:
+            time.sleep(INTER_PACKET_DELAY)
+
+        _advance_sample_deadline(time.perf_counter())
+
+        # 数据集保存
+        if dataset is not None:
+            if teleop is not None and not observation_frame:
+                obs = robot.get_observation()
+                observation_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
+
+            action_frame = build_dataset_frame(dataset.features, action_to_save, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
-        
-        # 5. display data [pass]
 
-        dt_s = time.perf_counter() - start_loop_t
-        sleep_s = max(0, 1 / fps - dt_s)
-        if sleep_s < 0:
-            logging.warning(f"Loop is running slower than the target fps ({1/dt_s:.2f} fps), consider reducing the fps or optimizing the processing pipeline.")
-        precise_sleep(sleep_s)
+        if start_episode_t is not None:
+            timestamp = time.perf_counter() - start_episode_t
 
-        timestamp = time.perf_counter() - start_episode_t
+        now = time.perf_counter()
+        if episode_started and now - last_diagnostic_time >= diagnostic_interval_s:
+            actual_fps = action_sent_count / timestamp if timestamp > 0 else 0
+
+            print(f"[FPS] t={timestamp:.1f}s actual={actual_fps:.2f}fps target={fps} sent={action_sent_count}")
+
+            last_diagnostic_time = now
 
 @parser.wrap()
 def record(cfg: RecordConfig) -> sLerobotDataset:
         init_logging()
-        logging.info(pformat(asdict(cfg)))
+        # logging.info(pformat(asdict(cfg)))
+        # logging.info(f"[TELEOP CFG] type={type(cfg.teleop)}, value={cfg.teleop}")
+
         
         # Initialize Fanuc robot with configuration
         robot = Fanuc(
@@ -356,6 +483,7 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
             
             if teleop is not None:
                 teleop.connect()
+                time.sleep(2.0)
 
             listener, events = init_keyboard_listener()
 
@@ -379,6 +507,9 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                         display_compressed_images=cfg.display_compressed_images,
+                        robot_speed=cfg.robot.speed,
+                        robot_term_type=cfg.robot.term_type,
+                        robot_term_value=cfg.robot.term_value,
                     )
 
                     if not events["stop_recording"] and (
@@ -397,6 +528,9 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                             single_task=cfg.dataset.single_task,
                             display_data=cfg.display_data,
                             display_compressed_images=cfg.display_compressed_images,
+                            robot_speed=cfg.robot.speed,
+                            robot_term_type=cfg.robot.term_type,
+                            robot_term_value=cfg.robot.term_value,
                         )
 
                     if events["rerecord_episode"]:

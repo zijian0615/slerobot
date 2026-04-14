@@ -70,66 +70,134 @@ def combine_feature_dicts(observation_features: dict | None, action_features: di
     """
     Combine observation and action feature dictionaries into a single feature dictionary.
     
+    Merges scalar features (float/int types) and 1D array features into single vector features.
+    Image/video features (2D+ tuples) are prefixed with "observation.images." or "action.images.".
+    
     Args:
         observation_features: Dictionary describing observation features
+            - Scalar types (float/int) or 1D tuples: merged into "observation.state"
+            - 2D+ tuples (shape): become "observation.images.{key}"
         action_features: Dictionary describing action features
+            - Scalar types (float/int) or 1D tuples: merged into "action"
+            - 2D+ tuples (shape): become "action.images.{key}"
         
     Returns:
-        Combined feature dictionary with 'observation' and 'action' keys
+        Combined feature dictionary with merged scalar features
     """
     features = dict(DEFAULT_FEATURES)
     
-    # Add observation features with proper format
+    # Process observation features
     if observation_features:
+        scalar_features = {}  # key -> shape_info
+        image_features = {}
+        
         for key, value in observation_features.items():
             if isinstance(value, tuple):
-                # It's a shape like (480, 640, 3)
-                features[f"observation.{key}"] = {
-                    "dtype": "image",
-                    "shape": value,
-                    "names": None
+                # Check tuple length to determine if it's a vector or image
+                if len(value) == 1:
+                    # 1D shape like (6,) -> vector feature
+                    scalar_features[key] = value[0]
+                else:
+                    # 2D+ shape like (480, 640, 3) -> image feature
+                    image_features[key] = value
+            elif value is float or value is int or (isinstance(value, type) and issubclass(value, (float, int))):
+                # Scalar type like float -> treat as single value
+                scalar_features[key] = 1
+        
+        # Create merged observation.state feature for all scalars/vectors
+        if scalar_features:
+            # For 1D shapes like (6,), expand them; for scalars, count as 1
+            scalar_names = []
+            for key, size in scalar_features.items():
+                if isinstance(size, int) and size > 1:
+                    # 1D array feature like (6,) -> use as single name
+                    scalar_names.append(key)
+                else:
+                    # Scalar feature -> use as single name
+                    scalar_names.append(key)
+            
+            # Calculate total dimension
+            total_dim = sum(scalar_features.values())
+            
+            features["observation.state"] = {
+                "dtype": "float32",
+                "shape": [total_dim],
+                "names": scalar_names
+            }
+        
+        # Add image features as video type with metadata
+        for img_key, img_shape in image_features.items():
+            h, w = img_shape[0], img_shape[1]
+            c = img_shape[2] if len(img_shape) > 2 else 3
+            features[f"observation.images.{img_key}"] = {
+                "dtype": "video",
+                "shape": [h, w, c],
+                "names": ["height", "width", "channels"],
+                "info": {
+                    "video.height": h,
+                    "video.width": w,
+                    "video.codec": "av1",
+                    "video.pix_fmt": "yuv420p",
+                    "video.is_depth_map": False,
+                    "video.fps": 30,
+                    "video.channels": c,
+                    "has_audio": False
                 }
-            elif value == float or value == int or isinstance(value, type):
-                # It's a scalar type - needs "names" for build_dataset_frame
-                dtype = "float32" if value == float else "int64" if value == int else "float32"
-                features[f"observation.{key}"] = {
-                    "dtype": dtype,
-                    "shape": (1,),
-                    "names": [key]  # Provide the field name as a list
-                }
-            else:
-                # Fallback
-                features[f"observation.{key}"] = {
-                    "dtype": "float32",
-                    "shape": (1,),
-                    "names": [key]
-                }
+            }
     
-    # Add action features with proper format
+    # Process action features
     if action_features:
+        scalar_features = {}  # key -> shape_info
+        image_features = {}
+        
         for key, value in action_features.items():
             if isinstance(value, tuple):
-                # It's a shape like (6,)
-                features[f"action.{key}"] = {
-                    "dtype": "image",
-                    "shape": value,
-                    "names": None
+                # Check tuple length to determine if it's a vector or image
+                if len(value) == 1:
+                    # 1D shape like (6,) -> vector feature
+                    scalar_features[key] = value[0]
+                else:
+                    # 2D+ shape -> image feature
+                    image_features[key] = value
+            elif value is float or value is int or (isinstance(value, type) and issubclass(value, (float, int))):
+                # Scalar type like float
+                scalar_features[key] = 1
+        
+        # Create merged action feature for all scalars/vectors
+        if scalar_features:
+            # For 1D shapes, expand them; for scalars, count as 1
+            scalar_names = []
+            for key, size in scalar_features.items():
+                scalar_names.append(key)
+            
+            # Calculate total dimension
+            total_dim = sum(scalar_features.values())
+            
+            features["action"] = {
+                "dtype": "float32",
+                "shape": [total_dim],
+                "names": scalar_names
+            }
+        
+        # Add image features as video type with metadata
+        for img_key, img_shape in image_features.items():
+            h, w = img_shape[0], img_shape[1]
+            c = img_shape[2] if len(img_shape) > 2 else 3
+            features[f"action.images.{img_key}"] = {
+                "dtype": "video",
+                "shape": [h, w, c],
+                "names": ["height", "width", "channels"],
+                "info": {
+                    "video.height": h,
+                    "video.width": w,
+                    "video.codec": "av1",
+                    "video.pix_fmt": "yuv420p",
+                    "video.is_depth_map": False,
+                    "video.fps": 30,
+                    "video.channels": c,
+                    "has_audio": False
                 }
-            elif value == float or value == int or isinstance(value, type):
-                # It's a scalar type - needs "names" for build_dataset_frame
-                dtype = "float32" if value == float else "int64" if value == int else "float32"
-                features[f"action.{key}"] = {
-                    "dtype": dtype,
-                    "shape": (1,),
-                    "names": [key]  # Provide the field name as a list
-                }
-            else:
-                # Fallback
-                features[f"action.{key}"] = {
-                    "dtype": "float32",
-                    "shape": (1,),
-                    "names": [key]
-                }
+            }
     
     return features
 
@@ -787,7 +855,7 @@ def validate_feature_numpy_array(
         if actual_dtype != np.dtype(expected_dtype):
             error_message += f"The feature '{name}' of dtype '{actual_dtype}' is not of the expected dtype '{expected_dtype}'.\n"
 
-        if actual_shape != expected_shape:
+        if actual_shape != tuple(expected_shape):
             error_message += f"The feature '{name}' of shape '{actual_shape}' does not have the expected shape '{expected_shape}'.\n"
     else:
         error_message += f"The feature '{name}' is not a 'np.ndarray'. Expected type is '{expected_dtype}', but type '{type(value)}' provided instead.\n"
@@ -1040,26 +1108,35 @@ def build_dataset_frame(
     for key, ft in ds_features.items():
         if key in DEFAULT_FEATURES or not key.startswith(prefix):
             continue
-        elif ft["dtype"] == "float32" and len(ft["shape"]) == 1:
-            # Check if all names exist in values before trying to access them
-            if ft["names"] and all(name in values for name in ft["names"]):
+        
+        # Handle merged scalar features (e.g., "observation.state", "action")
+        # These have dtype float32, a 1D shape, and a names list
+        if ft["dtype"] == "float32" and len(ft["shape"]) == 1 and ft["names"]:
+            # Merged feature with multiple scalar values
+            # Extract values by their names
+            try:
                 frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
-            elif ft["names"]:
-                # If some names are missing, fill with zeros
+            except KeyError as e:
+                # Fill with zeros for missing values
                 frame[key] = np.array([values.get(name, 0.0) for name in ft["names"]], dtype=np.float32)
+        
+        # Handle image/video fields
         elif ft["dtype"] in ["image", "video"]:
-            # Handle image/video fields
-            image_key = key.removeprefix(f"{prefix}.")
+            # Extract image key from full feature path
+            # For "observation.images.front", get "front"
+            image_key = key.split(".")[-1]
+            
             if image_key in values:
                 frame[key] = values[image_key]
 
     return frame
 
 
-def convert_quest3s_to_fanuc_action(quest_action: dict) -> dict:
-    """Convert Quest3s action format to Fanuc robot format.
+def convert_quest3s_to_fanuc_action(quest_action: dict, speed: int | None = None, term_type: str | None = None, term_value: int | None = None) -> dict:
+    """Convert Quest3s action format to Fanuc robot format with control parameters.
     
-    Converts from Quest3s teleoperation format (with nested dicts) to Fanuc robot format (with tuples).
+    Converts from Quest3s teleoperation format (with nested dicts) to Fanuc robot format,
+    optionally including motion control parameters.
     
     Args:
         quest_action: Dictionary with structure:
@@ -1069,27 +1146,37 @@ def convert_quest3s_to_fanuc_action(quest_action: dict) -> dict:
                 "buttons": {...},  # optional
                 ...
             }
+        speed: Robot movement speed (optional)
+        term_type: Termination type like "CNT" (optional)
+        term_value: Termination value (optional)
     
     Returns:
-        Dictionary with structure:
+        Dictionary with Fanuc robot format including optional control parameters:
             {
-                "position": (x, y, z),
-                "rotation": (w, p, r),
-                ...
+                "j0": x, "j1": y, "j2": z, "j3": w, "j4": p, "j5": r,
+                "speed": speed,           # if provided
+                "term_type": term_type,   # if provided
+                "term_value": term_value  # if provided
             }
     """
-    return {
-        "position": (
-            quest_action["position"]["x"],
-            quest_action["position"]["y"],
-            quest_action["position"]["z"],
-        ),
-        "rotation": (
-            quest_action["rotation"]["w"],
-            quest_action["rotation"]["p"],
-            quest_action["rotation"]["r"],
-        ),
+    action = {
+        "j0": quest_action["position"]["x"],
+        "j1": quest_action["position"]["y"],
+        "j2": quest_action["position"]["z"],
+        "j3": quest_action["rotation"]["w"],
+        "j4": quest_action["rotation"]["p"],
+        "j5": quest_action["rotation"]["r"],
     }
+    
+    # Add control parameters if provided
+    if speed is not None:
+        action["speed"] = speed
+    if term_type is not None:
+        action["term_type"] = term_type
+    if term_value is not None:
+        action["term_value"] = term_value
+    
+    return action
 
 # def combine_feature_dicts(*dicts: dict) -> dict:
 #     """Merge LeRobot grouped feature dicts.

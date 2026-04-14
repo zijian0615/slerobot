@@ -188,6 +188,7 @@ class Quest3sController(Teleoperator):
 
         self._lock = threading.Lock()
         self._latest_action = None
+        self._last_action_time = None
 
     def connect(self):
         try:
@@ -215,22 +216,26 @@ class Quest3sController(Teleoperator):
             logger.error(f"[Quest3s] Disconnection failed: {e}")
 
     def get_action(self):
-        """返回最新一帧，读完立即清空，无新数据返回 None。"""
+        """返回最新一帧；诊断阶段不清空，便于排除 MQTT 稀疏导致的降频。"""
         with self._lock:
-            action = self._latest_action
-            self._latest_action = None
-        return action
+            return self._latest_action
 
+    # def _on_connect(self, client, userdata, flags, rc):
+    #     logger.info(f"[Quest3s] MQTT Connected with result code {rc}")
+    #     client.subscribe(self.mqtt_topic)
     def _on_connect(self, client, userdata, flags, rc):
         logger.info(f"[Quest3s] MQTT Connected with result code {rc}")
-        client.subscribe(self.mqtt_topic)
-
+        result, mid = client.subscribe(self.mqtt_topic)
+        logger.info(f"[Quest3s] Subscribe result={result} mid={mid}")  # 加这行
     def _on_message(self, client, userdata, msg):
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
+            #print(f"[Quest3s] FULL PAYLOAD KEYS: {list(payload.keys())}", flush=True)  
+
             action = self._parse_payload(payload, datetime.now())
             with self._lock:
-                self._latest_action = action  
+                self._latest_action = action
+                self._last_action_time = time.perf_counter()
         except Exception as e:
             logger.error(f"[Quest3s] Message parsing failed: {e}")
 
@@ -244,8 +249,26 @@ class Quest3sController(Teleoperator):
         except Exception as e:
             logger.error(f"[Quest3s] MQTT loop error: {e}")
 
+    # def _parse_payload(self, payload: dict, timestamp: datetime) -> dict:
+    #     return {
+    #         'timestamp': timestamp,
+    #         'position': {
+    #             'x': payload.get('x', 0.0),
+    #             'y': payload.get('y', 0.0),
+    #             'z': payload.get('z', 0.0),
+    #         },
+    #         'rotation': {
+    #             'w': payload.get('w', 0.0),
+    #             'p': payload.get('p', 0.0),
+    #             'r': payload.get('r', 0.0),
+    #         },
+    #         'buttons': {
+    #             'trigger': payload.get('triggerButton', 0),
+    #             'grip': payload.get('gripButton', 0),
+    #         }
+    #     }
     def _parse_payload(self, payload: dict, timestamp: datetime) -> dict:
-        return {
+        result = {
             'timestamp': timestamp,
             'position': {
                 'x': payload.get('x', 0.0),
@@ -262,6 +285,8 @@ class Quest3sController(Teleoperator):
                 'grip': payload.get('gripButton', 0),
             }
         }
+        #print(f"[Quest3s] PARSED: pos=({result['position']['x']:.1f}, {result['position']['y']:.1f}, {result['position']['z']:.1f})", flush=True)
+        return result
 
     def __repr__(self):
         return f"Quest3sController({self.mqtt_broker}:{self.mqtt_port})"

@@ -1,5 +1,6 @@
 import json
 import logging
+import queue
 import socket
 import threading
 import time
@@ -13,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 
 class Fanuc(Robot):
+    STATE_POLL_HZ = 15.0
+
     def __init__(
         self,
         host: str,
@@ -36,6 +39,7 @@ class Fanuc(Robot):
         self._sock: Optional[socket.socket] = None
         self._buf = b""
         self._connected = False
+        self._send_lock = threading.Lock()
 
         self._latest_pose: Optional[Tuple[float, ...]] = None
         self._latest_t: Optional[float] = None
@@ -45,9 +49,11 @@ class Fanuc(Robot):
         # seq_id -> Future[int]，接收线程写入，发送方读取
         self._pending_futures: Dict[int, Future] = {}
         self._pending_lock = threading.Lock()
+        self._ack_queue: queue.Queue[Tuple[int, int]] = queue.Queue()
 
-        # 接收线程
+        # 后台线程
         self._recv_thread: Optional[threading.Thread] = None
+        self._state_thread: Optional[threading.Thread] = None
 
         # Initialize cameras as empty dict, will be set later if needed
         self.cameras = {}
@@ -86,6 +92,15 @@ class Fanuc(Robot):
         )
         self._recv_thread.start()
 
+        self._state_thread = threading.Thread(
+            target=self._state_poll_loop, name="fanuc-state-poll", daemon=True
+        )
+        self._state_thread.start()
+
+        print(f"[Fanuc] recv thread alive: {self._recv_thread.is_alive()}", flush=True)
+        deadline = time.time() + 1.0
+        while self._latest_pose is None and time.time() < deadline:
+            time.sleep(0.01)
         # self.get_observation()
         # logger.info(
         #     "Fanuc connected to %s:%s with UF=%s, UT=%s",
@@ -120,6 +135,9 @@ class Fanuc(Robot):
         if self._recv_thread is not None:
             self._recv_thread.join(timeout=2.0)
             self._recv_thread = None
+        if self._state_thread is not None:
+            self._state_thread.join(timeout=2.0)
+            self._state_thread = None
 
     # ------------------------------------------------------------------ #
     #  核心接口                                                              #
@@ -147,19 +165,37 @@ class Fanuc(Robot):
             "Flip": 0, "Turn4": 0, "Turn5": 0, "Turn6": 0,
         }
 
-        # Support both old and new action formats
-        # Old format: {"position": (x, y, z, w, p, r), ...}
-        # New format: {"position": (x, y, z), "rotation": (w, p, r), ...}
-        position = action["position"]
-        if len(position) == 6:
-            # Old format: unpack all 6 values from position
-            x, y, z, w, p, r = position
-        elif len(position) == 3:
-            # New format: position has 3 values, rotation is separate
-            x, y, z = position
-            w, p, r = action["rotation"]
+        # Support multiple action formats
+        # New format: {"j0": x, "j1": y, "j2": z, "j3": w, "j4": r, "j5": p} (from dataset)
+        # Legacy format: {"state": (x, y, z, w, p, r)} or {"position": (...), "rotation": (...)}
+        if "j0" in action and "j1" in action:
+            # New format: individual joint values
+            x = float(action["j0"])
+            y = float(action["j1"])
+            z = float(action["j2"])
+            w = float(action["j3"])
+            r = float(action["j4"])
+            p = float(action["j5"])
+        elif "state" in action:
+            # State format: 6D tuple/array
+            state = action["state"]
+            if len(state) == 6:
+                x, y, z, w, p, r = state
+            else:
+                raise ValueError(f"Invalid state format. Expected 6 values, got {len(state)}")
+        elif "position" in action:
+            position = action["position"]
+            if len(position) == 6:
+                # Old format: unpack all 6 values from position
+                x, y, z, w, p, r = position
+            elif len(position) == 3:
+                # Converted format: position has 3 values, rotation is separate
+                x, y, z = position
+                w, p, r = action["rotation"]
+            else:
+                raise ValueError(f"Invalid position format. Expected 3 or 6 values, got {len(position)}")
         else:
-            raise ValueError(f"Invalid position format. Expected 3 or 6 values, got {len(position)}")
+            raise ValueError("Action must contain 'j0'-'j5', 'state', or 'position' key")
 
         configuration = dict(self._latest_configuration or {})
         configuration.update(
@@ -207,23 +243,23 @@ class Fanuc(Robot):
 
     def get_observation(self) -> Dict:
         self._require_connected()
-        self._send_json({"Command": "FRC_ReadCartesianPosition", "Group": self._group})
-        # get_observation 在接收线程启动前可能被调用（connect 内部），
-        # 此时走同步路径；启动后接收线程会自动处理响应并更新 _latest_pose
-        if self._recv_thread is None or not self._recv_thread.is_alive():
-            resp = self._recv_until(lambda r: r.get("Command") == "FRC_ReadCartesianPosition")
-            self._update_pose_from_response(resp)
-        else:
-            # 接收线程负责更新，此处仅等待一次刷新
-            deadline = time.time() + 5.0
-            old_t = self._latest_t
-            while time.time() < deadline:
-                if self._latest_t != old_t:
-                    break
+        if self._latest_pose is None:
+            deadline = time.time() + 1.0
+            while self._latest_pose is None and time.time() < deadline:
                 time.sleep(0.01)
+        if self._latest_pose is None:
+            raise RuntimeError("No cartesian observation received yet.")
+        
+        # Extract individual joint values from position tuple (x, y, z, w, p, r)
+        x, y, z, w, p, r = self._latest_pose
         
         obs = {
-            "position": self._latest_pose,
+            "j0": float(x),  # x coordinate
+            "j1": float(y),  # y coordinate
+            "j2": float(z),  # z coordinate
+            "j3": float(w),  # w (wrist rotation)
+            "j4": float(r),  # r (roll)
+            "j5": float(p),  # p (pitch)
             "timestamp": self._latest_t,
             "controller_tick": self._latest_tick,
             "uframe": self._latest_configuration.get("UFrameNumber") if self._latest_configuration else None,
@@ -248,7 +284,7 @@ class Fanuc(Robot):
             try:
                 self._sock.settimeout(1.0)
                 resp = self._read_json()
-                # print(f"[recv] {resp}")   # ← 临时加这一行
+                #print(f"[recv] {resp}")   # ← 临时加这一行
             except socket.timeout:
                 continue
             except (ConnectionError, OSError) as exc:
@@ -267,31 +303,44 @@ class Fanuc(Robot):
 
         logger.debug("Fanuc recv loop exited")
 
+    def _state_poll_loop(self) -> None:
+        interval = 1.0 / self.STATE_POLL_HZ
+        while self._connected and self._sock is not None:
+            start_t = time.perf_counter()
+            try:
+                self._send_json({"Command": "FRC_ReadCartesianPosition", "Group": self._group})
+            except Exception as exc:
+                if self._connected:
+                    logger.error("State poll send error: %s", exc)
+                break
+            elapsed = time.perf_counter() - start_t
+            time.sleep(max(0.0, interval - elapsed))
+
     # ------------------------------------------------------------------ #
     #  内部工具                                                              #
     # ------------------------------------------------------------------ #
     def check_ack(self) -> Tuple[Optional[int], Optional[int]]:
-        with self._pending_lock:
-            for seq_id, fut in list(self._pending_futures.items()):
-                if fut.done():
-                    self._pending_futures.pop(seq_id)
-                    try:
-                        return seq_id, fut.result()
-                    except Exception:
-                        return seq_id, -1
-        return None, None
+        try:
+            return self._ack_queue.get_nowait()
+        except queue.Empty:
+            return None, None
+
     def _dispatch_response(self, resp: Dict) -> None:
-        if resp.get("Instruction") == "FRC_LinearMotion" and "SequenceID" in resp:
+        if resp.get("Command") == "FRC_ReadCartesianPosition":
+            self._update_pose_from_response(resp)
+            return
+
+        # Fanuc motion ACK may include `SequenceID` without echoing back
+        # `Instruction: FRC_LinearMotion`. Accept any packet carrying
+        # a sequence id as a motion completion/ack response.
+        if "SequenceID" in resp:
             seq_id = int(resp["SequenceID"])
             err_id = int(resp.get("ErrorID", -1))
             with self._pending_lock:
-                fut = self._pending_futures.get(seq_id, None)
+                fut = self._pending_futures.pop(seq_id, None)
             if fut is not None and not fut.done():
                 fut.set_result(err_id)
-            return
-
-        if resp.get("Command") == "FRC_ReadCartesianPosition":
-            self._update_pose_from_response(resp)
+            self._ack_queue.put((seq_id, err_id))
             return
 
         if resp.get("Communication") == "FRC_SystemFault":
@@ -322,7 +371,8 @@ class Fanuc(Robot):
 
     def _send_json(self, payload: Dict) -> None:
         # print(f"[send] {payload}")  
-        self._sock.sendall((json.dumps(payload) + "\r\n").encode("utf-8"))
+        with self._send_lock:
+            self._sock.sendall((json.dumps(payload) + "\r\n").encode("utf-8"))
 
     def _recv_until(self, predicate) -> Dict:
         """仅在接收线程启动前使用的同步接收。"""
@@ -369,14 +419,21 @@ class Fanuc(Robot):
 
     @property
     def observation_features(self) -> dict[str, type | tuple]:
-        """Get observation features including arm state and camera images."""
+        """Get observation features including arm state and camera images.
+        
+        Returns a dict where:
+        - Each joint position is a separate float feature (x, y, z, w, p, r)
+        - Camera names map to their image shapes (height, width, 3)
+        
+        These will be merged into "observation.state" by combine_feature_dicts.
+        """
         obs_feat = {
-            "x": float,
-            "y": float,
-            "z": float,
-            "w": float,
-            "r": float,
-            "p": float,  # Fixed: added 'p' instead of duplicate 'y'
+            "j0": float,  # x coordinate
+            "j1": float,  # y coordinate
+            "j2": float,  # z coordinate
+            "j3": float,  # w (wrist rotation)
+            "j4": float,  # r (roll)
+            "j5": float,  # p (pitch)
         }
         
         # Add camera features if cameras are configured
@@ -391,14 +448,20 @@ class Fanuc(Robot):
     
     @property
     def action_features(self) -> dict[str, type | tuple]:
-        """Get action features for the arm."""
+        """Get action features for the arm.
+        
+        Returns a dict where:
+        - Each joint target is a separate float feature (j0-j5 for x, y, z, w, r, p)
+        
+        These will be merged into "action" by combine_feature_dicts.
+        """
         return {
-            "x": float,
-            "y": float,
-            "z": float,
-            "w": float,
-            "r": float,
-            "p": float,  # Fixed: added 'p' instead of duplicate 'y'
+            "j0": float,  # x coordinate
+            "j1": float,  # y coordinate
+            "j2": float,  # z coordinate
+            "j3": float,  # w (wrist rotation)
+            "j4": float,  # r (roll)
+            "j5": float,  # p (pitch)
         }
     
     @property
