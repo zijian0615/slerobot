@@ -100,6 +100,15 @@ class FanucConfig:
     speed: int = 250
     term_type: str = "CNT"
     term_value: int = 100
+    gripper_lcb_type: Optional[str] = "TA"
+    gripper_lcb_value: int = 10
+    gripper_port_type: Optional[int] = 2
+    gripper_state_port_number: Optional[int] = None
+    gripper_port_number: Optional[int] = None
+    gripper_open_port_number: Optional[int] = 3
+    gripper_close_port_number: Optional[int] = 4
+    gripper_open_value: str = "ON"
+    gripper_close_value: str = "ON"
     id: str = "robot-1"
 
 
@@ -138,9 +147,12 @@ def teleop_loop(controller, robot, cfg: TeleoperateConfig):
     BUFFER_SIZE = 2
     MIN_DIST_MM = 0.5
     INTER_PACKET_DELAY = 0.002
+    DEBUG_GRIPPER = True
 
     pending: set = set()
     last_sent_pose = None
+    last_sent_grip = None
+    warned_missing_gripper_config = False
     buffer_full = False
     start = time.perf_counter()
     
@@ -176,32 +188,103 @@ def teleop_loop(controller, robot, cfg: TeleoperateConfig):
             action["rotation"]["p"],
             action["rotation"]["r"],
         )
+        grip_pressed = int(action.get("buttons", {}).get("grip", 0))
+        trigger_pressed = int(action.get("buttons", {}).get("trigger", 0))
+
+        # if DEBUG_GRIPPER and grip_pressed != last_sent_grip:
+        #     print(
+        #         "\n[DEBUG][GRIP INPUT] "
+        #         f"grip={grip_pressed} trigger={trigger_pressed} "
+        #         f"raw_buttons={action.get('buttons', {})}",
+        #         flush=True,
+        #     )
 
         # 4. 空间滤波
         if last_sent_pose is not None:
             dx = target_pose[0] - last_sent_pose[0]
             dy = target_pose[1] - last_sent_pose[1]
             dz = target_pose[2] - last_sent_pose[2]
-            if (dx**2 + dy**2 + dz**2) ** 0.5 < MIN_DIST_MM:
+            grip_changed = last_sent_grip is None or grip_pressed != last_sent_grip
+            if (dx**2 + dy**2 + dz**2) ** 0.5 < MIN_DIST_MM and not grip_changed:
                 time.sleep(0.001)
                 continue
         
         # 5. 发送
-        fut = robot.send_action({
+        robot_action = {
             "position": target_pose,
             "speed": cfg.robot.speed,
             "term_type": cfg.robot.term_type,
             "term_value": cfg.robot.term_value,
-        })
+        }
+
+        selected_gripper_port = None
+        if (
+            cfg.robot.gripper_open_port_number is not None
+            and cfg.robot.gripper_close_port_number is not None
+        ):
+            selected_gripper_port = (
+                cfg.robot.gripper_close_port_number
+                if grip_pressed
+                else cfg.robot.gripper_open_port_number
+            )
+        elif cfg.robot.gripper_port_number is not None:
+            selected_gripper_port = cfg.robot.gripper_port_number
+
+        if (
+            cfg.robot.gripper_lcb_type is not None
+            and cfg.robot.gripper_port_type is not None
+            and selected_gripper_port is not None
+        ):
+            robot_action.update(
+                {
+                    "lcb_type": cfg.robot.gripper_lcb_type,
+                    "lcb_value": cfg.robot.gripper_lcb_value,
+                    "port_type": cfg.robot.gripper_port_type,
+                    "port_number": selected_gripper_port,
+                    "port_value": (
+                        cfg.robot.gripper_close_value
+                        if grip_pressed
+                        else cfg.robot.gripper_open_value
+                    ),
+                }
+            )
+            if DEBUG_GRIPPER:
+                print(
+                    "[DEBUG][GRIP SEND] "
+                    f"grip={grip_pressed} -> port_value={robot_action['port_value']} "
+                    f"lcb_type={robot_action['lcb_type']} lcb_value={robot_action['lcb_value']} "
+                    f"port_type={robot_action['port_type']} port_number={robot_action['port_number']}",
+                    flush=True,
+                )
+        elif DEBUG_GRIPPER and not warned_missing_gripper_config:
+            print(
+                "\n[WARN][GRIP CONFIG] 未配置完整夹爪参数，当前不会下发夹爪控制包。"
+                f" lcb_type={cfg.robot.gripper_lcb_type}"
+                f" port_type={cfg.robot.gripper_port_type}"
+                f" state_port_number={cfg.robot.gripper_state_port_number}"
+                f" shared_port_number={cfg.robot.gripper_port_number}"
+                f" open_port_number={cfg.robot.gripper_open_port_number}"
+                f" close_port_number={cfg.robot.gripper_close_port_number}",
+                flush=True,
+            )
+            warned_missing_gripper_config = True
+
+        fut = robot.send_action(robot_action)
         seq_id = robot.seq_id - 1
         pending.add(seq_id)
+        if DEBUG_GRIPPER:
+            print(
+                f"[DEBUG][SEND ACTION] seq_id={seq_id} pending={len(pending)} action={robot_action}",
+                flush=True,
+            )
         last_sent_pose = target_pose
+        last_sent_grip = grip_pressed
 
         if not buffer_full and len(pending) >= BUFFER_SIZE:
             time.sleep(INTER_PACKET_DELAY)
 
         if cfg.display_data:
-            print(f"pose={target_pose}  pending={len(pending)}")
+            print(f"pose={target_pose} grip={grip_pressed} pending={len(pending)}")
 
         loop_s = time.perf_counter() - t_start
         print(f"\rLoop: {loop_s*1e3:.1f}ms ({1/loop_s:.0f} Hz) pending={len(pending)}  ", end="", flush=True)
@@ -223,6 +306,22 @@ def teleoperate(cfg: TeleoperateConfig):
         speed=cfg.robot.speed,
         term_type=cfg.robot.term_type,
         term_value=cfg.robot.term_value,
+        gripper_port_number=cfg.robot.gripper_state_port_number,
+    )
+
+    print(
+        "[DEBUG][ROBOT CONFIG] "
+        f"host={cfg.robot.host}:{cfg.robot.port} speed={cfg.robot.speed} "
+        f"term=({cfg.robot.term_type}, {cfg.robot.term_value}) "
+        f"gripper_lcb_type={cfg.robot.gripper_lcb_type} "
+        f"gripper_lcb_value={cfg.robot.gripper_lcb_value} "
+        f"gripper_port_type={cfg.robot.gripper_port_type} "
+        f"gripper_state_port_number={cfg.robot.gripper_state_port_number} "
+        f"gripper_port_number={cfg.robot.gripper_port_number} "
+        f"gripper_open_port_number={cfg.robot.gripper_open_port_number} "
+        f"gripper_close_port_number={cfg.robot.gripper_close_port_number} "
+        f"open={cfg.robot.gripper_open_value} close={cfg.robot.gripper_close_value}",
+        flush=True,
     )
 
     controller.connect()

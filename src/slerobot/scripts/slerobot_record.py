@@ -81,6 +81,15 @@ class FanucConfig:
         speed: Robot speed percentage (default: 150)
         term_type: Termination type (default: "CNT")
         term_value: Termination value (default: 100)
+        gripper_lcb_type: Fanuc linear control block type for gripper output (default: "TA")
+        gripper_lcb_value: Fanuc linear control block value for gripper output (default: 10)
+        gripper_port_type: Fanuc output port type for gripper control (default: 2)
+        gripper_state_port_number: Fanuc DIN input port used to read gripper state (default: None)
+        gripper_port_number: Shared Fanuc output port used to control gripper (default: None)
+        gripper_open_port_number: Fanuc output port used to open gripper (default: 3)
+        gripper_close_port_number: Fanuc output port used to close gripper (default: 4)
+        gripper_open_value: Fanuc output value used to open gripper (default: "ON")
+        gripper_close_value: Fanuc output value used to close gripper (default: "ON")
         cameras: Dictionary of camera configurations (default: None)
             Example: {"front": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 20}}
     """
@@ -92,6 +101,15 @@ class FanucConfig:
     speed: int = 250
     term_type: str = "CNT"
     term_value: int = 100
+    gripper_lcb_type: str | None = "TA"
+    gripper_lcb_value: int = 10
+    gripper_port_type: int | None = 2
+    gripper_state_port_number: int | None = None
+    gripper_port_number: int | None = None
+    gripper_open_port_number: int | None = 3
+    gripper_close_port_number: int | None = 4
+    gripper_open_value: str = "ON"
+    gripper_close_value: str = "ON"
     cameras: dict[str, Any] | None = None
 
 
@@ -203,6 +221,14 @@ def record_loop(
     robot_speed: int | None = None,
     robot_term_type: str | None = None,
     robot_term_value: int | None = None,
+    gripper_lcb_type: str | None = None,
+    gripper_lcb_value: int = 10,
+    gripper_port_type: int | None = None,
+    gripper_port_number: int | None = None,
+    gripper_open_port_number: int | None = None,
+    gripper_close_port_number: int | None = None,
+    gripper_open_value: str = "ON",
+    gripper_close_value: str = "ON",
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -213,6 +239,8 @@ def record_loop(
 
     pending: set = set()
     last_sent_pose = None
+    last_sent_grip = None
+    observation_grip_value: float | None = None
 
     no_action_count = 0
     timestamp = 0.0
@@ -318,13 +346,16 @@ def record_loop(
                 action["rotation"]["p"],
                 action["rotation"]["r"],
             )
+            grip_pressed = int(action.get("buttons", {}).get("grip", 0))
+            observation_grip_value = float(grip_pressed)
 
             if last_sent_pose is not None:
                 dx = target_pose[0] - last_sent_pose[0]
                 dy = target_pose[1] - last_sent_pose[1]
                 dz = target_pose[2] - last_sent_pose[2]
                 dist = (dx**2 + dy**2 + dz**2) ** 0.5
-                if dist < MIN_DIST_MM:
+                grip_changed = last_sent_grip is None or grip_pressed != last_sent_grip
+                if dist < MIN_DIST_MM and not grip_changed:
                     time.sleep(0.001)
                     action_skipped_spatial_filter += 1
                     # if action_skipped_spatial_filter % 100 == 0:
@@ -341,11 +372,42 @@ def record_loop(
                 "term_type": robot_term_type,
                 "term_value": robot_term_value,
             }
+
+            selected_gripper_port = None
+            if (
+                gripper_open_port_number is not None
+                and gripper_close_port_number is not None
+            ):
+                selected_gripper_port = (
+                    gripper_close_port_number if grip_pressed else gripper_open_port_number
+                )
+            elif gripper_port_number is not None:
+                selected_gripper_port = gripper_port_number
+
+            if (
+                gripper_lcb_type is not None
+                and gripper_port_type is not None
+                and selected_gripper_port is not None
+            ):
+                teleop_action.update(
+                    {
+                        "lcb_type": gripper_lcb_type,
+                        "lcb_value": gripper_lcb_value,
+                        "port_type": gripper_port_type,
+                        "port_number": selected_gripper_port,
+                        "port_value": (
+                            gripper_close_value if grip_pressed else gripper_open_value
+                        ),
+                    }
+                )
+
             action_to_save = {
                 "j0": target_pose[0], "j1": target_pose[1], "j2": target_pose[2],
                 "j3": target_pose[3], "j4": target_pose[4], "j5": target_pose[5],
+                "j7": float(grip_pressed),
             }
             last_sent_pose = target_pose
+            last_sent_grip = grip_pressed
             observation_frame = {}
 
         else:
@@ -373,6 +435,8 @@ def record_loop(
         if dataset is not None:
             if teleop is not None and not observation_frame:
                 obs = robot.get_observation()
+                if observation_grip_value is not None:
+                    obs["j7"] = observation_grip_value
                 observation_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
 
             action_frame = build_dataset_frame(dataset.features, action_to_save, prefix=ACTION)
@@ -407,6 +471,7 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
             speed=cfg.robot.speed,
             term_type=cfg.robot.term_type,
             term_value=cfg.robot.term_value,
+            gripper_port_number=cfg.robot.gripper_state_port_number,
         )
         # Store cameras config if provided
         if cfg.robot.cameras is not None:
@@ -510,6 +575,14 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                         robot_speed=cfg.robot.speed,
                         robot_term_type=cfg.robot.term_type,
                         robot_term_value=cfg.robot.term_value,
+                        gripper_lcb_type=cfg.robot.gripper_lcb_type,
+                        gripper_lcb_value=cfg.robot.gripper_lcb_value,
+                        gripper_port_type=cfg.robot.gripper_port_type,
+                        gripper_port_number=cfg.robot.gripper_port_number,
+                        gripper_open_port_number=cfg.robot.gripper_open_port_number,
+                        gripper_close_port_number=cfg.robot.gripper_close_port_number,
+                        gripper_open_value=cfg.robot.gripper_open_value,
+                        gripper_close_value=cfg.robot.gripper_close_value,
                     )
 
                     if not events["stop_recording"] and (
@@ -531,6 +604,14 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                             robot_speed=cfg.robot.speed,
                             robot_term_type=cfg.robot.term_type,
                             robot_term_value=cfg.robot.term_value,
+                            gripper_lcb_type=cfg.robot.gripper_lcb_type,
+                            gripper_lcb_value=cfg.robot.gripper_lcb_value,
+                            gripper_port_type=cfg.robot.gripper_port_type,
+                            gripper_port_number=cfg.robot.gripper_port_number,
+                            gripper_open_port_number=cfg.robot.gripper_open_port_number,
+                            gripper_close_port_number=cfg.robot.gripper_close_port_number,
+                            gripper_open_value=cfg.robot.gripper_open_value,
+                            gripper_close_value=cfg.robot.gripper_close_value,
                         )
 
                     if events["rerecord_episode"]:

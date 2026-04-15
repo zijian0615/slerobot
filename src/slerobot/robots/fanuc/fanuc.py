@@ -26,6 +26,7 @@ class Fanuc(Robot):
         speed: int = 150,
         term_type: str = "CNT",
         term_value: int = 100,
+        gripper_port_number: int | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -35,6 +36,7 @@ class Fanuc(Robot):
         self._speed = speed
         self._term_type = term_type
         self._term_value = term_value
+        self._gripper_port_number = gripper_port_number
 
         self._sock: Optional[socket.socket] = None
         self._buf = b""
@@ -45,6 +47,7 @@ class Fanuc(Robot):
         self._latest_t: Optional[float] = None
         self._latest_tick: Optional[int] = None
         self._latest_configuration: Optional[Dict] = None
+        self._latest_gripper_state: Optional[int] = None
 
         # seq_id -> Future[int]，接收线程写入，发送方读取
         self._pending_futures: Dict[int, Future] = {}
@@ -166,7 +169,7 @@ class Fanuc(Robot):
         }
 
         # Support multiple action formats
-        # New format: {"j0": x, "j1": y, "j2": z, "j3": w, "j4": r, "j5": p} (from dataset)
+        # New format: {"j0": x, "j1": y, "j2": z, "j3": w, "j4": p, "j5": r} (from dataset)
         # Legacy format: {"state": (x, y, z, w, p, r)} or {"position": (...), "rotation": (...)}
         if "j0" in action and "j1" in action:
             # New format: individual joint values
@@ -174,8 +177,8 @@ class Fanuc(Robot):
             y = float(action["j1"])
             z = float(action["j2"])
             w = float(action["j3"])
-            r = float(action["j4"])
-            p = float(action["j5"])
+            p = float(action["j4"])
+            r = float(action["j5"])
         elif "state" in action:
             # State format: 6D tuple/array
             state = action["state"]
@@ -229,9 +232,29 @@ class Fanuc(Robot):
             "TermType": str(action.get("term_type", self._term_type)),
             "TermValue": int(action.get("term_value", self._term_value)),
         }
-        for key in ("LCBType", "LCBValue", "PortType", "PortNumber", "PortValue"):
-            if key in action:
-                packet[key] = action[key]
+
+        lcb_type = action.get("lcb_type", action.get("LCBType"))
+        lcb_value = action.get("lcb_value", action.get("LCBValue", 0))
+        port_type = action.get("port_type", action.get("PortType"))
+        port_number = action.get("port_number", action.get("PortNumber"))
+        port_value = action.get("port_value", action.get("PortValue"))
+
+        if (
+            lcb_type is not None
+            and port_type is not None
+            and port_number is not None
+            and port_value is not None
+        ):
+            packet.update(
+                {
+                    "LCBType": str(lcb_type),
+                    "LCBValue": int(lcb_value),
+                    "PortType": int(port_type),
+                    "PortNumber": int(port_number),
+                    "PortValue": str(port_value),
+                }
+            )
+            logger.info("Fanuc gripper packet=%s", packet)
 
         # 先注册 Future，再发送，避免接收线程在发送完成前就收到 ACK 找不到槽位
         fut: Future = Future()
@@ -249,6 +272,10 @@ class Fanuc(Robot):
                 time.sleep(0.01)
         if self._latest_pose is None:
             raise RuntimeError("No cartesian observation received yet.")
+        if self._gripper_port_number is not None and self._latest_gripper_state is None:
+            deadline = time.time() + 1.0
+            while self._latest_gripper_state is None and time.time() < deadline:
+                time.sleep(0.01)
         
         # Extract individual joint values from position tuple (x, y, z, w, p, r)
         x, y, z, w, p, r = self._latest_pose
@@ -258,13 +285,24 @@ class Fanuc(Robot):
             "j1": float(y),  # y coordinate
             "j2": float(z),  # z coordinate
             "j3": float(w),  # w (wrist rotation)
-            "j4": float(r),  # r (roll)
-            "j5": float(p),  # p (pitch)
+            "j4": float(p),  # p (pitch)
+            "j5": float(r),  # r (roll)
+            "j7": (
+                float(self._latest_gripper_state)
+                if self._latest_gripper_state is not None
+                else 0.0
+            ),
             "timestamp": self._latest_t,
             "controller_tick": self._latest_tick,
             "uframe": self._latest_configuration.get("UFrameNumber") if self._latest_configuration else None,
             "utool": self._latest_configuration.get("UToolNumber") if self._latest_configuration else None,
         }
+        if self._gripper_port_number is not None:
+            obs["gripper_state"] = (
+                float(self._latest_gripper_state)
+                if self._latest_gripper_state is not None
+                else 0.0
+            )
         
         # Add camera observations if cameras are configured
         if self.cameras:
@@ -309,6 +347,13 @@ class Fanuc(Robot):
             start_t = time.perf_counter()
             try:
                 self._send_json({"Command": "FRC_ReadCartesianPosition", "Group": self._group})
+                if self._gripper_port_number is not None:
+                    self._send_json(
+                        {
+                            "Command": "FRC_ReadDIN",
+                            "PortNumber": int(self._gripper_port_number),
+                        }
+                    )
             except Exception as exc:
                 if self._connected:
                     logger.error("State poll send error: %s", exc)
@@ -328,6 +373,10 @@ class Fanuc(Robot):
     def _dispatch_response(self, resp: Dict) -> None:
         if resp.get("Command") == "FRC_ReadCartesianPosition":
             self._update_pose_from_response(resp)
+            return
+
+        if resp.get("Command") == "FRC_ReadDIN":
+            self._update_gripper_state_from_response(resp)
             return
 
         # Fanuc motion ACK may include `SequenceID` without echoing back
@@ -395,6 +444,16 @@ class Fanuc(Robot):
         self._latest_tick = resp.get("TimeTag")
         self._latest_configuration = dict(config)
 
+    def _update_gripper_state_from_response(self, resp: Dict) -> None:
+        if resp.get("ErrorID", -1) != 0:
+            logger.error("FRC_ReadDIN failed: %s", resp)
+            return
+
+        try:
+            self._latest_gripper_state = int(resp["PortValue"])
+        except (KeyError, TypeError, ValueError):
+            logger.error("Invalid FRC_ReadDIN response: %s", resp)
+
     def _read_json(self) -> Dict:
         while b"\n" not in self._buf:
             chunk = self._sock.recv(65536)
@@ -432,8 +491,9 @@ class Fanuc(Robot):
             "j1": float,  # y coordinate
             "j2": float,  # z coordinate
             "j3": float,  # w (wrist rotation)
-            "j4": float,  # r (roll)
-            "j5": float,  # p (pitch)
+            "j4": float,  # p (pitch)
+            "j5": float,  # r (roll)
+            "j7": float,  # gripper state
         }
         
         # Add camera features if cameras are configured
@@ -451,7 +511,7 @@ class Fanuc(Robot):
         """Get action features for the arm.
         
         Returns a dict where:
-        - Each joint target is a separate float feature (j0-j5 for x, y, z, w, r, p)
+        - Each joint target is a separate float feature (j0-j5 for x, y, z, w, p, r)
         
         These will be merged into "action" by combine_feature_dicts.
         """
@@ -460,8 +520,9 @@ class Fanuc(Robot):
             "j1": float,  # y coordinate
             "j2": float,  # z coordinate
             "j3": float,  # w (wrist rotation)
-            "j4": float,  # r (roll)
-            "j5": float,  # p (pitch)
+            "j4": float,  # p (pitch)
+            "j5": float,  # r (roll)
+            "j7": float,  # gripper command/state
         }
     
     @property
