@@ -86,7 +86,18 @@ class Fanuc(Robot):
         if resp.get("ErrorID", -1) != 0:
             raise RuntimeError(f"FRC_Initialize failed: {resp}")
 
-        #self._set_uframe_utool(self._uframe, self._utool)
+        self._set_uframe_utool(self._uframe, self._utool)
+        self._latest_configuration = {
+            "UToolNumber": self._utool,
+            "UFrameNumber": self._uframe,
+            "Front": 1,
+            "Up": 1,
+            "Left": 0,
+            "Flip": 0,
+            "Turn4": 0,
+            "Turn5": 0,
+            "Turn6": 0,
+        }
         self._connected = True
 
         # 启动后台接收线程

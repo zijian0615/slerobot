@@ -312,6 +312,31 @@ class sLerobotDataset(torch.utils.data.Dataset):
         hf_dataset = load_nested_dataset(self.root / "data", features=features, episodes=self.episodes)
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
+
+    def _check_cached_episodes_sufficient(self) -> bool:
+        """Check whether the locally cached dataset can satisfy the requested episodes.
+
+        When `self.episodes` is `None`, any successfully loaded dataset is sufficient.
+        When a subset of episodes is requested, verify that all requested episode indices
+        are present in the loaded Hugging Face dataset.
+        """
+        if self.episodes is None:
+            return True
+
+        if self.hf_dataset is None or len(self.hf_dataset) == 0:
+            return False
+
+        try:
+            loaded_episode_indices = self.hf_dataset["episode_index"]
+        except Exception:
+            return False
+
+        available_episodes = {
+            int(ep.item()) if isinstance(ep, torch.Tensor) else int(ep)
+            for ep in loaded_episode_indices
+        }
+        requested_episodes = {int(ep) for ep in self.episodes}
+        return requested_episodes.issubset(available_episodes)
     
     def create_hf_dataset(self) -> datasets.Dataset:
         features = get_hf_features_from_features(self.features)

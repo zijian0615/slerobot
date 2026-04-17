@@ -6,6 +6,9 @@ from pprint import pformat
 from typing import Any
 
 from slerobot.configs import parser
+from slerobot.configs.policies import PreTrainedConfig
+from slerobot.configs.train import TrainPipelineConfig
+from slerobot.configs.types import FeatureType, NormalizationMode
 from slerobot.teleoperators import Teleoperator,quest3s
 from slerobot.teleoperators.quest3s import Quest3sController
 from slerobot.robots import Robot,fanuc
@@ -13,12 +16,18 @@ from slerobot.robots.fanuc import Fanuc
 from slerobot.cameras.utils import make_cameras_from_configs
 
 from slerobot.utils.constants import ACTION, OBS_STR
-from slerobot.datasets.slerobot_datasets import sLerobotDataset
+from slerobot.datasets.slerobot_datasets import sLerobotDataset, sLerobotDatasetMetadata
 from slerobot.datasets.utils import build_dataset_frame,combine_feature_dicts,convert_quest3s_to_fanuc_action
 from slerobot.datasets.video_utils import VideoEncodingManager
+
+from slerobot.policies.pretrained import PreTrainedPolicy
+from slerobot.policies.utils import build_inference_frame, make_robot_action # tensor to dict
+
 from slerobot.utils.control_utils import init_keyboard_listener,is_headless
 from slerobot.utils.robot_utils import precise_sleep
 from slerobot.utils.utils import init_logging, log_say
+
+
 
 @dataclass
 class DatasetRecordConfig:
@@ -148,7 +157,7 @@ class RecordConfig:
     dataset: DatasetRecordConfig
     robot: FanucConfig = field(default_factory=FanucConfig)
     teleop: Quest3sConfig | None = None
-    policy: object | None = None
+    policy: PreTrainedConfig | None = None
     display_data: bool = False
     display_ip: str | None = None
     display_port: int | None = None
@@ -162,7 +171,15 @@ class RecordConfig:
         Note: teleop and policy can both be None initially, but at least one must be
         provided when record() is actually called.
         """
-        pass
+        policy_path = parser.get_path_arg("policy")
+
+        if policy_path:
+            cli_overrides = parser.get_cli_overrides("policy")
+            self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
+            self.policy.pretrained_path = Path(policy_path)
+
+        if self.teleop is None and self.policy is None:
+            raise ValueError("Choose a policy, a teleoperator or both to control the robot")
     
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -207,13 +224,119 @@ class RecordConfig:
                 ( Rerun Log / Loop Wait ) """
 
 
+def _load_policy_dataset_stats(policy_cfg: PreTrainedConfig | None) -> dict[str, dict[str, Any]] | None:
+    if policy_cfg is None or policy_cfg.pretrained_path is None:
+        return None
+
+    try:
+        train_cfg = TrainPipelineConfig.from_pretrained(policy_cfg.pretrained_path)
+        ds_meta = sLerobotDatasetMetadata(
+            repo_id=train_cfg.dataset.repo_id,
+            root=train_cfg.dataset.root,
+            revision=train_cfg.dataset.revision,
+        )
+    except Exception as exc:
+        logging.warning("[POLICY_STATS] failed to load training dataset stats: %s", exc)
+        return None
+
+    if ds_meta.stats is None:
+        logging.warning("[POLICY_STATS] training dataset stats not found, policy I/O will stay unnormalized")
+        return None
+
+    logging.info(
+        "[POLICY_STATS] loaded training stats from repo_id=%s root=%s",
+        ds_meta.repo_id,
+        ds_meta.root,
+    )
+    return ds_meta.stats
+
+
+def _get_torch_module():
+    return __import__("torch")
+
+
+def _to_tensor_stat(value: Any, *, device: Any, dtype: Any) -> Any:
+    torch = _get_torch_module()
+    return torch.as_tensor(value, device=device, dtype=dtype)
+
+
+def _normalize_tensor_mean_std(tensor: Any, stats: dict[str, Any]) -> Any:
+    torch = _get_torch_module()
+    mean = _to_tensor_stat(stats["mean"], device=tensor.device, dtype=tensor.dtype)
+    std = _to_tensor_stat(stats["std"], device=tensor.device, dtype=tensor.dtype)
+    return (tensor - mean) / torch.clamp(std, min=1e-6)
+
+
+def _unnormalize_tensor_mean_std(tensor: Any, stats: dict[str, Any]) -> Any:
+    torch = _get_torch_module()
+    mean = _to_tensor_stat(stats["mean"], device=tensor.device, dtype=tensor.dtype)
+    std = _to_tensor_stat(stats["std"], device=tensor.device, dtype=tensor.dtype)
+    return tensor * torch.clamp(std, min=1e-6) + mean
+
+
+def _prepare_policy_inference_batch(
+    observation: dict[str, Any],
+    policy: PreTrainedPolicy,
+    ds_features: dict[str, dict],
+    policy_stats: dict[str, dict[str, Any]] | None,
+    task: str | None,
+    robot_type: str | None,
+) -> dict[str, Any]:
+    batch = build_inference_frame(
+        observation=observation,
+        device=policy.config.device or "cpu",
+        ds_features=ds_features,
+        task=task,
+        robot_type=robot_type,
+    )
+
+    expected_inputs = policy.config.input_features or {}
+    missing_inputs = [key for key in expected_inputs if key not in batch]
+    if missing_inputs:
+        raise ValueError(f"Missing policy inputs at inference time: {missing_inputs}")
+
+    for key, feature in expected_inputs.items():
+        if key not in batch or policy_stats is None or key not in policy_stats:
+            continue
+
+        norm_mode = policy.config.normalization_mapping.get(feature.type.value)
+        if norm_mode != NormalizationMode.MEAN_STD:
+            continue
+
+        if feature.type not in {FeatureType.STATE, FeatureType.VISUAL, FeatureType.ENV}:
+            continue
+
+        batch[key] = _normalize_tensor_mean_std(batch[key], policy_stats[key])
+
+    return batch
+
+
+def _postprocess_policy_action_tensor(
+    action_tensor: Any,
+    policy: PreTrainedPolicy,
+    policy_stats: dict[str, dict[str, Any]] | None,
+) -> Any:
+    if policy_stats is None or ACTION not in policy_stats:
+        return action_tensor
+
+    action_feature = policy.config.action_feature
+    if action_feature is None:
+        return action_tensor
+
+    norm_mode = policy.config.normalization_mapping.get(action_feature.type.value)
+    if norm_mode != NormalizationMode.MEAN_STD:
+        return action_tensor
+
+    return _unnormalize_tensor_mean_std(action_tensor, policy_stats[ACTION])
+
+
 def record_loop(
     robot: Robot,
     events: dict,
     fps: int,
     dataset: sLerobotDataset | None = None,
     teleop: Teleoperator | None = None,
-    policy: None = None,
+    policy: PreTrainedPolicy | None = None,
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
@@ -229,12 +352,17 @@ def record_loop(
     gripper_close_port_number: int | None = None,
     gripper_open_value: str = "ON",
     gripper_close_value: str = "ON",
+    policy_stats: dict[str, dict[str, Any]] | None = None,
+    record_data: bool = True,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
 
+    if policy is not None:
+        policy.reset()
+
     BUFFER_SIZE = 4
-    MIN_DIST_MM = 0.5
+    MIN_DIST_MM = 0.15
     INTER_PACKET_DELAY = 0.002
 
     pending: set = set()
@@ -259,6 +387,51 @@ def record_loop(
 
     _baseline_printed = False
     _waiting_for_first_action_logged = False
+    _policy_flow_logged = False
+
+    def _convert_policy_delta_to_absolute(
+        obs: dict[str, Any], policy_delta_action: dict[str, float]
+    ) -> dict[str, float]:
+        absolute_action = dict(policy_delta_action)
+        for key in ("j0", "j1", "j2", "j3", "j4", "j5"):
+            absolute_action[key] = float(obs[key]) + float(policy_delta_action[key])
+        return absolute_action
+
+    def _build_policy_robot_action(policy_action: dict[str, float]) -> dict[str, Any]:
+        robot_action = dict(policy_action)
+
+        raw_j7 = float(policy_action.get("j7", 0.0))
+        discrete_j7 = float(raw_j7 >= 0.5)
+        robot_action["j7"] = discrete_j7
+
+        selected_gripper_port = None
+        if (
+            gripper_open_port_number is not None
+            and gripper_close_port_number is not None
+        ):
+            selected_gripper_port = (
+                gripper_close_port_number if discrete_j7 else gripper_open_port_number
+            )
+        elif gripper_port_number is not None:
+            selected_gripper_port = gripper_port_number
+
+        if (
+            gripper_lcb_type is not None
+            and gripper_port_type is not None
+            and selected_gripper_port is not None
+        ):
+            robot_action.update(
+                {
+                    "lcb_type": gripper_lcb_type,
+                    "lcb_value": gripper_lcb_value,
+                    "port_type": gripper_port_type,
+                    "port_number": selected_gripper_port,
+                    "port_value": gripper_close_value if discrete_j7 else gripper_open_value,
+                }
+            )
+
+        logging.info("[POLICY_J7] raw=%s discrete=%s", raw_j7, discrete_j7)
+        return robot_action
 
     def _advance_sample_deadline(now_t: float) -> None:
         nonlocal next_sample_t
@@ -301,13 +474,65 @@ def record_loop(
             continue
 
         if policy is not None:
+            if dataset is None:
+                raise ValueError("Dataset is required when running a policy during recording.")
+
             obs = robot.get_observation()
-            action = policy.predict(obs)
-            policy_action = action
+            observation_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
+            inference_batch = _prepare_policy_inference_batch(
+                observation=obs,
+                policy=policy,
+                ds_features=dataset.features,
+                policy_stats=policy_stats,
+                task=single_task,
+                robot_type=getattr(robot, "name", "fanuc"),
+            )
+            policy_action_tensor = policy.select_action(inference_batch)
+            policy_action_tensor = _postprocess_policy_action_tensor(
+                policy_action_tensor,
+                policy=policy,
+                policy_stats=policy_stats,
+            )
+            policy_delta_action = make_robot_action(policy_action_tensor, dataset.features)
+            policy_action = _convert_policy_delta_to_absolute(obs, policy_delta_action)
+            policy_action = _build_policy_robot_action(policy_action)
+
+            if not _policy_flow_logged:
+                _policy_flow_logged = True
+                logging.info("[POLICY_FLOW] input_keys=%s", sorted(inference_batch.keys()))
+                logging.info("[POLICY_FLOW] action_names=%s", dataset.features[ACTION]["names"])
+                logging.info("[POLICY_FLOW] using_stats=%s", policy_stats is not None)
+
+            target_pose = (
+                policy_action["j0"],
+                policy_action["j1"],
+                policy_action["j2"],
+                policy_action["j3"],
+                policy_action["j4"],
+                policy_action["j5"],
+            )
+
+            if last_sent_pose is not None:
+                dx = target_pose[0] - last_sent_pose[0]
+                dy = target_pose[1] - last_sent_pose[1]
+                dz = target_pose[2] - last_sent_pose[2]
+                dist = (dx**2 + dy**2 + dz**2) ** 0.5
+                if dist < MIN_DIST_MM:
+                    logging.info(
+                        "[POLICY_FILTERED] dist=%.4fmm threshold=%.4f target_pose=%s last_sent_pose=%s",
+                        dist,
+                        MIN_DIST_MM,
+                        target_pose[:3],
+                        last_sent_pose[:3],
+                    )
+                    time.sleep(0.001)
+                    action_skipped_spatial_filter += 1
+                    _advance_sample_deadline(time.perf_counter())
+                    continue
+
+            logging.info("[POLICY_DELTA_ACTION] %s", policy_delta_action)
+            logging.info("[POLICY_ABS_ACTION] %s", policy_action)
             action_to_save = policy_action
-            observation_frame = {}
-            if dataset is not None:
-                observation_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
 
         elif teleop is not None:
             action = teleop.get_action()
@@ -356,6 +581,13 @@ def record_loop(
                 dist = (dx**2 + dy**2 + dz**2) ** 0.5
                 grip_changed = last_sent_grip is None or grip_pressed != last_sent_grip
                 if dist < MIN_DIST_MM and not grip_changed:
+                    logging.info(
+                        "[TELEOP_FILTERED] dist=%.4fmm threshold=%.4f target_pose=%s last_sent_pose=%s",
+                        dist,
+                        MIN_DIST_MM,
+                        target_pose[:3],
+                        last_sent_pose[:3],
+                    )
                     time.sleep(0.001)
                     action_skipped_spatial_filter += 1
                     # if action_skipped_spatial_filter % 100 == 0:
@@ -419,7 +651,20 @@ def record_loop(
 
         # send_action
         action_to_send = policy_action if policy is not None else teleop_action
+        if policy is not None:
+            logging.info("[POLICY_SEND_ACTION] %s", action_to_send)
         robot.send_action(action_to_send)
+
+        if policy is not None:
+            last_sent_pose = (
+                action_to_send["j0"],
+                action_to_send["j1"],
+                action_to_send["j2"],
+                action_to_send["j3"],
+                action_to_send["j4"],
+                action_to_send["j5"],
+            )
+            last_sent_grip = int(action_to_send.get("j7", 0.0) >= 0.5)
 
         seq_id = robot.seq_id - 1
         pending.add(seq_id)
@@ -432,7 +677,7 @@ def record_loop(
         _advance_sample_deadline(time.perf_counter())
 
         # 数据集保存
-        if dataset is not None:
+        if record_data and dataset is not None:
             if teleop is not None and not observation_frame:
                 obs = robot.get_observation()
                 if observation_grip_value is not None:
@@ -492,6 +737,23 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
         else:
             teleop = None
 
+        policy = None
+        policy_stats = None
+        if cfg.policy is not None:
+            if cfg.policy.pretrained_path is None:
+                raise ValueError("Policy config is missing `pretrained_path`. Please pass `--policy.path=...`.")
+
+            if cfg.policy.type == "act":
+                from slerobot.policies.act.modeling_act import ACTPolicy
+
+                policy = ACTPolicy.from_pretrained(
+                    pretrained_name_or_path=cfg.policy.pretrained_path,
+                    config=cfg.policy,
+                )
+                policy_stats = _load_policy_dataset_stats(cfg.policy)
+            else:
+                raise ValueError(f"Unsupported policy type for recording: {cfg.policy.type}")
+
         dataset_features = combine_feature_dicts(
             robot.observation_features,
             robot.action_features,
@@ -537,8 +799,6 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                     encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
                     encoder_threads=cfg.dataset.encoder_threads,
                 )
-            # Load pretrained policy
-            policy = None #[# TODO: use teleop rgiht now, will implement the policy loading later]
 
             robot.connect()
             
@@ -583,6 +843,8 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                         gripper_close_port_number=cfg.robot.gripper_close_port_number,
                         gripper_open_value=cfg.robot.gripper_open_value,
                         gripper_close_value=cfg.robot.gripper_close_value,
+                        policy_stats=policy_stats,
+                        record_data=True,
                     )
 
                     if not events["stop_recording"] and (
@@ -612,6 +874,8 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                             gripper_close_port_number=cfg.robot.gripper_close_port_number,
                             gripper_open_value=cfg.robot.gripper_open_value,
                             gripper_close_value=cfg.robot.gripper_close_value,
+                            policy_stats=policy_stats,
+                            record_data=False,
                         )
 
                     if events["rerecord_episode"]:
