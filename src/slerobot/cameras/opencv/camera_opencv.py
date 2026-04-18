@@ -168,13 +168,39 @@ class OpenCVCamera(Camera):
         self._start_read_thread()
 
         if warmup and self.warmup_s > 0:
-            start_time = time.time()
-            while time.time() - start_time < self.warmup_s:
-                self.async_read(timeout_ms=self.warmup_s * 1000)
-                time.sleep(0.1)
+            deadline = time.time() + self.warmup_s
+            while time.time() < deadline:
+                remaining_s = max(0.0, deadline - time.time())
+                timeout_ms = max(100.0, min(500.0, remaining_s * 1000))
+                try:
+                    self.async_read(timeout_ms=timeout_ms)
+                    time.sleep(0.1)
+                except TimeoutError:
+                    logger.warning(
+                        "%s did not provide a frame during warmup yet; retrying for %.1f more ms.",
+                        self,
+                        timeout_ms,
+                    )
+
+            if self.latest_frame is None:
+                for _ in range(3):
+                    try:
+                        raw_frame = self._read_from_hardware()
+                        processed_frame = self._postprocess_image(raw_frame)
+                        with self.frame_lock:
+                            self.latest_frame = processed_frame
+                            self.latest_timestamp = time.perf_counter()
+                        self.new_frame_event.set()
+                        break
+                    except Exception:
+                        time.sleep(0.2)
+
             with self.frame_lock:
                 if self.latest_frame is None:
-                    raise ConnectionError(f"{self} failed to capture frames during warmup.")
+                    raise ConnectionError(
+                        f"{self} failed to capture frames during warmup. "
+                        f"Try increasing warmup_s, lowering requested fps/resolution, or checking camera permissions."
+                    )
 
         logger.info(f"{self} connected.")
 

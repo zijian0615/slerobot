@@ -1,33 +1,37 @@
 import logging
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
-from pprint import pformat
 from typing import Any
 
 from slerobot.configs import parser
 from slerobot.configs.policies import PreTrainedConfig
-from slerobot.configs.train import TrainPipelineConfig
-from slerobot.configs.types import FeatureType, NormalizationMode
-from slerobot.teleoperators import Teleoperator,quest3s
+from slerobot.teleoperators import Teleoperator
 from slerobot.teleoperators.quest3s import Quest3sController
-from slerobot.robots import Robot,fanuc
+from slerobot.robots import Robot
 from slerobot.robots.fanuc import Fanuc
 from slerobot.cameras.utils import make_cameras_from_configs
 
 from slerobot.utils.constants import ACTION, OBS_STR
-from slerobot.datasets.slerobot_datasets import sLerobotDataset, sLerobotDatasetMetadata
-from slerobot.datasets.utils import build_dataset_frame,combine_feature_dicts,convert_quest3s_to_fanuc_action
+from slerobot.datasets.slerobot_datasets import sLerobotDataset
+from slerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
 from slerobot.datasets.video_utils import VideoEncodingManager
 
 from slerobot.policies.pretrained import PreTrainedPolicy
-from slerobot.policies.utils import build_inference_frame, make_robot_action # tensor to dict
+from slerobot.policies.utils import make_robot_action
 
-from slerobot.utils.control_utils import init_keyboard_listener,is_headless
-from slerobot.utils.robot_utils import precise_sleep
-from slerobot.utils.utils import init_logging, log_say
+from slerobot.utils.control_utils import init_keyboard_listener, is_headless, predict_action
+from slerobot.utils.utils import get_safe_torch_device, init_logging, log_say
 
-
+from slerobot.processor import (
+    PolicyAction,
+    PolicyProcessorPipeline,
+    RobotAction,
+    RobotObservation,
+    RobotProcessorPipeline,
+    make_default_processors,
+)
+from slerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 
 @dataclass
 class DatasetRecordConfig:
@@ -190,157 +194,116 @@ class RecordConfig:
         return ["policy"]
 
 
+def _apply_robot_action_metadata(
+    action: RobotAction,
+    *,
+    robot_speed: int | None,
+    robot_term_type: str | None,
+    robot_term_value: int | None,
+    gripper_lcb_type: str | None,
+    gripper_lcb_value: int,
+    gripper_port_type: int | None,
+    gripper_port_number: int | None,
+    gripper_open_port_number: int | None,
+    gripper_close_port_number: int | None,
+    gripper_open_value: str,
+    gripper_close_value: str,
+) -> RobotAction:
+    robot_action = dict(action)
 
-""" This enables the parser to load config from the policy using `--policy.path=local/dir`
-        pass
+    if robot_speed is not None:
+        robot_action.setdefault("speed", robot_speed)
+    if robot_term_type is not None:
+        robot_action.setdefault("term_type", robot_term_type)
+    if robot_term_value is not None:
+        robot_action.setdefault("term_value", robot_term_value)
 
-    --------------- record_loop() data flow --------------------------
-    # just ignore all the processor right now
-    [ Robot ]
-        V
-    [ robot.get_observation() ] ---> raw_obs
-        V
-    [ robot_observation_processor ] ---> processed_obs
-        V
-    .-----( ACTION LOGIC )------------------.
-    V                                       V
-    [ From Teleoperator ]                   [ From Policy ]
-    |                                       |
-    |  [teleop.get_action] -> raw_action    |   [predict_action]
-    |          |                            |          |
-    |          V                            |          V
-    | [teleop_action_processor]             |          |
-    |          |                            |          |
-    '---> processed_teleop_action           '---> processed_policy_action
-    |                                       |
-    '-------------------------.-------------'
-                            V
-                [ robot_action_processor ] --> robot_action_to_send
-                            V
-                    [ robot.send_action() ] -- (Robot Executes)
-                            V
-                    ( Save to Dataset )
-                            V
-                ( Rerun Log / Loop Wait ) """
+    if "j7" not in robot_action:
+        return robot_action
 
+    discrete_j7 = float(float(robot_action["j7"]) >= 0.5)
+    robot_action["j7"] = discrete_j7
 
-def _load_policy_dataset_stats(policy_cfg: PreTrainedConfig | None) -> dict[str, dict[str, Any]] | None:
-    if policy_cfg is None or policy_cfg.pretrained_path is None:
-        return None
+    selected_gripper_port = None
+    if gripper_open_port_number is not None and gripper_close_port_number is not None:
+        selected_gripper_port = gripper_close_port_number if discrete_j7 else gripper_open_port_number
+    elif gripper_port_number is not None:
+        selected_gripper_port = gripper_port_number
 
-    try:
-        train_cfg = TrainPipelineConfig.from_pretrained(policy_cfg.pretrained_path)
-        ds_meta = sLerobotDatasetMetadata(
-            repo_id=train_cfg.dataset.repo_id,
-            root=train_cfg.dataset.root,
-            revision=train_cfg.dataset.revision,
+    if (
+        gripper_lcb_type is not None
+        and gripper_port_type is not None
+        and selected_gripper_port is not None
+    ):
+        robot_action.update(
+            {
+                "lcb_type": gripper_lcb_type,
+                "lcb_value": gripper_lcb_value,
+                "port_type": gripper_port_type,
+                "port_number": selected_gripper_port,
+                "port_value": gripper_close_value if discrete_j7 else gripper_open_value,
+            }
         )
-    except Exception as exc:
-        logging.warning("[POLICY_STATS] failed to load training dataset stats: %s", exc)
-        return None
 
-    if ds_meta.stats is None:
-        logging.warning("[POLICY_STATS] training dataset stats not found, policy I/O will stay unnormalized")
-        return None
-
-    logging.info(
-        "[POLICY_STATS] loaded training stats from repo_id=%s root=%s",
-        ds_meta.repo_id,
-        ds_meta.root,
-    )
-    return ds_meta.stats
+    return robot_action
 
 
-def _get_torch_module():
-    return __import__("torch")
+def _log_policy_action_flow(act_processed_policy: RobotAction, robot_action_to_send: RobotAction) -> None:
+    debug_counter = getattr(_log_policy_action_flow, "_debug_counter", 0)
+    if debug_counter >= 10:
+        return
+
+    logging.info("[POLICY_ACTION_DICT] %s", act_processed_policy)
+    logging.info("[ROBOT_ACTION_TO_SEND] %s", robot_action_to_send)
+    setattr(_log_policy_action_flow, "_debug_counter", debug_counter + 1)
 
 
-def _to_tensor_stat(value: Any, *, device: Any, dtype: Any) -> Any:
-    torch = _get_torch_module()
-    return torch.as_tensor(value, device=device, dtype=dtype)
+def _log_processor_pipeline(name: str, pipeline: PolicyProcessorPipeline | None) -> None:
+    if pipeline is None:
+        logging.info("[%s] None", name)
+        return
 
+    step_summaries: list[str] = []
+    for idx, step in enumerate(pipeline.steps):
+        config = getattr(step, "config", None)
+        if not config:
+            config = {
+                key: value
+                for key, value in vars(step).items()
+                if key not in {"_current_transition", "stats"}
+            }
 
-def _normalize_tensor_mean_std(tensor: Any, stats: dict[str, Any]) -> Any:
-    torch = _get_torch_module()
-    mean = _to_tensor_stat(stats["mean"], device=tensor.device, dtype=tensor.dtype)
-    std = _to_tensor_stat(stats["std"], device=tensor.device, dtype=tensor.dtype)
-    return (tensor - mean) / torch.clamp(std, min=1e-6)
+        state_keys: list[str] = []
+        if hasattr(step, "state_dict"):
+            try:
+                state_keys = list(step.state_dict().keys())
+            except Exception:
+                state_keys = ["<state_dict_error>"]
 
+        step_summaries.append(
+            f"step={idx} class={step.__class__.__name__} config={config} state_keys={state_keys}"
+        )
 
-def _unnormalize_tensor_mean_std(tensor: Any, stats: dict[str, Any]) -> Any:
-    torch = _get_torch_module()
-    mean = _to_tensor_stat(stats["mean"], device=tensor.device, dtype=tensor.dtype)
-    std = _to_tensor_stat(stats["std"], device=tensor.device, dtype=tensor.dtype)
-    return tensor * torch.clamp(std, min=1e-6) + mean
-
-
-def _prepare_policy_inference_batch(
-    observation: dict[str, Any],
-    policy: PreTrainedPolicy,
-    ds_features: dict[str, dict],
-    policy_stats: dict[str, dict[str, Any]] | None,
-    task: str | None,
-    robot_type: str | None,
-) -> dict[str, Any]:
-    batch = build_inference_frame(
-        observation=observation,
-        device=policy.config.device or "cpu",
-        ds_features=ds_features,
-        task=task,
-        robot_type=robot_type,
-    )
-
-    expected_inputs = policy.config.input_features or {}
-    missing_inputs = [key for key in expected_inputs if key not in batch]
-    if missing_inputs:
-        raise ValueError(f"Missing policy inputs at inference time: {missing_inputs}")
-
-    for key, feature in expected_inputs.items():
-        if key not in batch or policy_stats is None or key not in policy_stats:
-            continue
-
-        norm_mode = policy.config.normalization_mapping.get(feature.type.value)
-        if norm_mode != NormalizationMode.MEAN_STD:
-            continue
-
-        if feature.type not in {FeatureType.STATE, FeatureType.VISUAL, FeatureType.ENV}:
-            continue
-
-        batch[key] = _normalize_tensor_mean_std(batch[key], policy_stats[key])
-
-    return batch
-
-
-def _postprocess_policy_action_tensor(
-    action_tensor: Any,
-    policy: PreTrainedPolicy,
-    policy_stats: dict[str, dict[str, Any]] | None,
-) -> Any:
-    if policy_stats is None or ACTION not in policy_stats:
-        return action_tensor
-
-    action_feature = policy.config.action_feature
-    if action_feature is None:
-        return action_tensor
-
-    norm_mode = policy.config.normalization_mapping.get(action_feature.type.value)
-    if norm_mode != NormalizationMode.MEAN_STD:
-        return action_tensor
-
-    return _unnormalize_tensor_mean_std(action_tensor, policy_stats[ACTION])
+    for summary in step_summaries:
+        logging.info("[%s] %s", name, summary)
 
 
 def record_loop(
     robot: Robot,
     events: dict,
     fps: int,
+    teleop_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction] | None = None,
+    robot_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction] | None = None,
+    robot_observation_processor: RobotProcessorPipeline[RobotObservation, RobotObservation] | None = None,
     dataset: sLerobotDataset | None = None,
-    teleop: Teleoperator | None = None,
+    teleop: Teleoperator | list | None = None,
     policy: PreTrainedPolicy | None = None,
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
     display_compressed_images: bool = False,
+    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,
+    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None,
     robot_speed: int | None = None,
     robot_term_type: str | None = None,
     robot_term_value: int | None = None,
@@ -352,112 +315,51 @@ def record_loop(
     gripper_close_port_number: int | None = None,
     gripper_open_value: str = "ON",
     gripper_close_value: str = "ON",
-    policy_stats: dict[str, dict[str, Any]] | None = None,
     record_data: bool = True,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
 
+    if policy is not None and dataset is None:
+        raise ValueError("A dataset is required when using a policy for recording.")
+
     if policy is not None:
         policy.reset()
 
+    if (
+        teleop_action_processor is None
+        or robot_action_processor is None
+        or robot_observation_processor is None
+    ):
+        default_teleop_processor, default_robot_action_processor, default_robot_observation_processor = (
+            make_default_processors()
+        )
+        teleop_action_processor = teleop_action_processor or default_teleop_processor
+        robot_action_processor = robot_action_processor or default_robot_action_processor
+        robot_observation_processor = robot_observation_processor or default_robot_observation_processor
+
     BUFFER_SIZE = 4
-    MIN_DIST_MM = 0.15
     INTER_PACKET_DELAY = 0.002
 
     pending: set = set()
-    last_sent_pose = None
-    last_sent_grip = None
     observation_grip_value: float | None = None
 
     no_action_count = 0
     timestamp = 0.0
-    start_episode_t = time.perf_counter() if policy is not None else None
-    episode_started = policy is not None
+    start_episode_t = time.perf_counter()
 
     action_sent_count = 0
     action_skipped_buffer_full = 0
-    action_skipped_no_action = 0
-    action_skipped_spatial_filter = 0
     last_diagnostic_time = time.perf_counter()
     diagnostic_interval_s = 1.0
 
-    sample_period_s = 1.0 / fps
-    next_sample_t: float | None = None
-
-    _baseline_printed = False
-    _waiting_for_first_action_logged = False
-    _policy_flow_logged = False
-
-    def _convert_policy_delta_to_absolute(
-        obs: dict[str, Any], policy_delta_action: dict[str, float]
-    ) -> dict[str, float]:
-        absolute_action = dict(policy_delta_action)
-        for key in ("j0", "j1", "j2", "j3", "j4", "j5"):
-            absolute_action[key] = float(obs[key]) + float(policy_delta_action[key])
-        return absolute_action
-
-    def _build_policy_robot_action(policy_action: dict[str, float]) -> dict[str, Any]:
-        robot_action = dict(policy_action)
-
-        raw_j7 = float(policy_action.get("j7", 0.0))
-        discrete_j7 = float(raw_j7 >= 0.5)
-        robot_action["j7"] = discrete_j7
-
-        selected_gripper_port = None
-        if (
-            gripper_open_port_number is not None
-            and gripper_close_port_number is not None
-        ):
-            selected_gripper_port = (
-                gripper_close_port_number if discrete_j7 else gripper_open_port_number
-            )
-        elif gripper_port_number is not None:
-            selected_gripper_port = gripper_port_number
-
-        if (
-            gripper_lcb_type is not None
-            and gripper_port_type is not None
-            and selected_gripper_port is not None
-        ):
-            robot_action.update(
-                {
-                    "lcb_type": gripper_lcb_type,
-                    "lcb_value": gripper_lcb_value,
-                    "port_type": gripper_port_type,
-                    "port_number": selected_gripper_port,
-                    "port_value": gripper_close_value if discrete_j7 else gripper_open_value,
-                }
-            )
-
-        logging.info("[POLICY_J7] raw=%s discrete=%s", raw_j7, discrete_j7)
-        return robot_action
-
-    def _advance_sample_deadline(now_t: float) -> None:
-        nonlocal next_sample_t
-        if next_sample_t is None:
-            return
-        next_sample_t += sample_period_s
-        while next_sample_t <= now_t:
-            next_sample_t += sample_period_s
-
     while True:
-        start_loop_t = time.perf_counter()
-
-        if episode_started and control_time_s is not None and timestamp >= control_time_s:
+        if control_time_s is not None and timestamp >= control_time_s:
             break
 
         if events["exit_early"]:
             events["exit_early"] = False
             break
-
-        if episode_started:
-            if next_sample_t is None and start_episode_t is not None:
-                next_sample_t = start_episode_t
-            if next_sample_t is not None:
-                now_t = time.perf_counter()
-                if now_t < next_sample_t:
-                    precise_sleep(next_sample_t - now_t)
 
         while True:
             seq_id, err = robot.check_ack()
@@ -465,206 +367,98 @@ def record_loop(
                 break
             pending.discard(seq_id)
 
-        # Buffer 满时跳帧
         if len(pending) >= BUFFER_SIZE:
             time.sleep(0.001)
             action_skipped_buffer_full += 1
-            if episode_started:
-                _advance_sample_deadline(time.perf_counter())
+            timestamp = time.perf_counter() - start_episode_t
             continue
 
-        if policy is not None:
-            if dataset is None:
-                raise ValueError("Dataset is required when running a policy during recording.")
+        obs = robot.get_observation()
+        if observation_grip_value is not None:
+            obs["j7"] = observation_grip_value
+        obs = robot_observation_processor(obs)
 
-            obs = robot.get_observation()
-            observation_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
-            inference_batch = _prepare_policy_inference_batch(
-                observation=obs,
+        observation_frame = (
+            build_dataset_frame(dataset.features, obs, prefix=OBS_STR) if dataset is not None else {}
+        )
+
+        act_processed_policy: RobotAction | None = None
+        act_processed_teleop: RobotAction | None = None
+        action_values: RobotAction | PolicyAction | None = None
+
+        if policy is not None and preprocessor is not None and postprocessor is not None and record_data:
+            robot_type = getattr(robot, "robot_type", getattr(robot, "name", robot.__class__.__name__.lower()))
+            action_values = predict_action(
+                observation=observation_frame,
                 policy=policy,
-                ds_features=dataset.features,
-                policy_stats=policy_stats,
+                device=get_safe_torch_device(policy.config.device),
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                use_amp=policy.config.use_amp,
                 task=single_task,
-                robot_type=getattr(robot, "name", "fanuc"),
+                robot_type=robot_type,
             )
-            policy_action_tensor = policy.select_action(inference_batch)
-            policy_action_tensor = _postprocess_policy_action_tensor(
-                policy_action_tensor,
-                policy=policy,
-                policy_stats=policy_stats,
-            )
-            policy_delta_action = make_robot_action(policy_action_tensor, dataset.features)
-            policy_action = _convert_policy_delta_to_absolute(obs, policy_delta_action)
-            policy_action = _build_policy_robot_action(policy_action)
-
-            if not _policy_flow_logged:
-                _policy_flow_logged = True
-                logging.info("[POLICY_FLOW] input_keys=%s", sorted(inference_batch.keys()))
-                logging.info("[POLICY_FLOW] action_names=%s", dataset.features[ACTION]["names"])
-                logging.info("[POLICY_FLOW] using_stats=%s", policy_stats is not None)
-
-            target_pose = (
-                policy_action["j0"],
-                policy_action["j1"],
-                policy_action["j2"],
-                policy_action["j3"],
-                policy_action["j4"],
-                policy_action["j5"],
-            )
-
-            if last_sent_pose is not None:
-                dx = target_pose[0] - last_sent_pose[0]
-                dy = target_pose[1] - last_sent_pose[1]
-                dz = target_pose[2] - last_sent_pose[2]
-                dist = (dx**2 + dy**2 + dz**2) ** 0.5
-                if dist < MIN_DIST_MM:
-                    logging.info(
-                        "[POLICY_FILTERED] dist=%.4fmm threshold=%.4f target_pose=%s last_sent_pose=%s",
-                        dist,
-                        MIN_DIST_MM,
-                        target_pose[:3],
-                        last_sent_pose[:3],
-                    )
-                    time.sleep(0.001)
-                    action_skipped_spatial_filter += 1
-                    _advance_sample_deadline(time.perf_counter())
-                    continue
-
-            logging.info("[POLICY_DELTA_ACTION] %s", policy_delta_action)
-            logging.info("[POLICY_ABS_ACTION] %s", policy_action)
-            action_to_save = policy_action
-
-        elif teleop is not None:
-            action = teleop.get_action()
-
-            if not _baseline_printed:
-                _baseline_printed = True
-
-            if action is None:
-                time.sleep(0.001)
-                if not episode_started:
-                    if not _waiting_for_first_action_logged:
-                        _waiting_for_first_action_logged = True
-                else:
-                    action_skipped_no_action += 1
-                    # if action_skipped_no_action % 50 == 0:
-                    #     logging.warning(
-                    #         f"[NO_ACTION] 已连续跳过 {action_skipped_no_action} 帧（无 MQTT 数据），"
-                    #         f"累计耗时 {timestamp:.1f}s。请检查 Quest3s 是否在发送数据。"
-                    #     )
-                    _advance_sample_deadline(time.perf_counter())
+            act_processed_policy = make_robot_action(action_values, dataset.features)
+        elif policy is None and isinstance(teleop, Teleoperator):
+            act = teleop.get_action()
+            if act is None:
+                time.sleep(0.005)
+                timestamp = time.perf_counter() - start_episode_t
                 continue
-
-            if not episode_started:
-                start_episode_t = time.perf_counter()
-                timestamp = 0.0
-                episode_started = True
-                last_diagnostic_time = start_episode_t
-                next_sample_t = start_episode_t
-                # logging.info("[START] 收到首个 teleop action，开始记录 episode 时间与诊断统计。")
-
-            target_pose = (
-                action["position"]["x"],
-                action["position"]["y"],
-                action["position"]["z"],
-                action["rotation"]["w"],
-                action["rotation"]["p"],
-                action["rotation"]["r"],
-            )
-            grip_pressed = int(action.get("buttons", {}).get("grip", 0))
-            observation_grip_value = float(grip_pressed)
-
-            if last_sent_pose is not None:
-                dx = target_pose[0] - last_sent_pose[0]
-                dy = target_pose[1] - last_sent_pose[1]
-                dz = target_pose[2] - last_sent_pose[2]
-                dist = (dx**2 + dy**2 + dz**2) ** 0.5
-                grip_changed = last_sent_grip is None or grip_pressed != last_sent_grip
-                if dist < MIN_DIST_MM and not grip_changed:
-                    logging.info(
-                        "[TELEOP_FILTERED] dist=%.4fmm threshold=%.4f target_pose=%s last_sent_pose=%s",
-                        dist,
-                        MIN_DIST_MM,
-                        target_pose[:3],
-                        last_sent_pose[:3],
-                    )
-                    time.sleep(0.001)
-                    action_skipped_spatial_filter += 1
-                    # if action_skipped_spatial_filter % 100 == 0:
-                    #     logging.warning(
-                    #         f"[SPATIAL_FILTER] 已跳过 {action_skipped_spatial_filter} 帧（dist={dist:.4f}mm < {MIN_DIST_MM}mm）。"
-                    #         f"机器人静止或 MIN_DIST_MM 设置过大？"
-                    #     )
-                    _advance_sample_deadline(time.perf_counter())
-                    continue
-
-            teleop_action = {
-                "position": target_pose,
-                "speed": robot_speed,
-                "term_type": robot_term_type,
-                "term_value": robot_term_value,
-            }
-
-            selected_gripper_port = None
-            if (
-                gripper_open_port_number is not None
-                and gripper_close_port_number is not None
-            ):
-                selected_gripper_port = (
-                    gripper_close_port_number if grip_pressed else gripper_open_port_number
-                )
-            elif gripper_port_number is not None:
-                selected_gripper_port = gripper_port_number
-
-            if (
-                gripper_lcb_type is not None
-                and gripper_port_type is not None
-                and selected_gripper_port is not None
-            ):
-                teleop_action.update(
-                    {
-                        "lcb_type": gripper_lcb_type,
-                        "lcb_value": gripper_lcb_value,
-                        "port_type": gripper_port_type,
-                        "port_number": selected_gripper_port,
-                        "port_value": (
-                            gripper_close_value if grip_pressed else gripper_open_value
-                        ),
-                    }
-                )
-
-            action_to_save = {
-                "j0": target_pose[0], "j1": target_pose[1], "j2": target_pose[2],
-                "j3": target_pose[3], "j4": target_pose[4], "j5": target_pose[5],
-                "j7": float(grip_pressed),
-            }
-            last_sent_pose = target_pose
-            last_sent_grip = grip_pressed
-            observation_frame = {}
-
+            act_processed_teleop = teleop_action_processor((act, obs))
+        elif policy is None and isinstance(teleop, list):
+            teleop_arm, teleop_keyboard = teleop
+            arm_action = teleop_arm.get_action()
+            if arm_action is None:
+                time.sleep(0.005)
+                timestamp = time.perf_counter() - start_episode_t
+                continue
+            arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+            keyboard_action = teleop_keyboard.get_action()
+            base_action = robot._from_keyboard_to_base_action(keyboard_action)
+            act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+            act_processed_teleop = teleop_action_processor((act, obs))
         else:
             no_action_count += 1
-            if no_action_count == 1 or no_action_count % 10000 == 0:
-                logging.warning("No policy or teleoperator provided, skipping action generation.")
-            time.sleep(0.001)
+            if no_action_count == 1 or no_action_count % 10 == 0:
+                logging.warning(
+                    "No policy or teleoperator provided, skipping action generation. "
+                    "This is likely to happen when resetting the environment without a teleop device. "
+                    "The robot won't be at its rest position at the start of the next episode."
+                )
+            time.sleep(0.01)
+            timestamp = time.perf_counter() - start_episode_t
             continue
 
-        # send_action
-        action_to_send = policy_action if policy is not None else teleop_action
-        if policy is not None:
-            logging.info("[POLICY_SEND_ACTION] %s", action_to_send)
-        robot.send_action(action_to_send)
+        no_action_count = 0
 
-        if policy is not None:
-            last_sent_pose = (
-                action_to_send["j0"],
-                action_to_send["j1"],
-                action_to_send["j2"],
-                action_to_send["j3"],
-                action_to_send["j4"],
-                action_to_send["j5"],
-            )
-            last_sent_grip = int(action_to_send.get("j7", 0.0) >= 0.5)
+        if policy is not None and act_processed_policy is not None:
+            action_values = act_processed_policy
+            robot_action_to_send = robot_action_processor((act_processed_policy, obs))
+        else:
+            action_values = act_processed_teleop
+            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+
+        robot_action_to_send = _apply_robot_action_metadata(
+            robot_action_to_send,
+            robot_speed=robot_speed,
+            robot_term_type=robot_term_type,
+            robot_term_value=robot_term_value,
+            gripper_lcb_type=gripper_lcb_type,
+            gripper_lcb_value=gripper_lcb_value,
+            gripper_port_type=gripper_port_type,
+            gripper_port_number=gripper_port_number,
+            gripper_open_port_number=gripper_open_port_number,
+            gripper_close_port_number=gripper_close_port_number,
+            gripper_open_value=gripper_open_value,
+            gripper_close_value=gripper_close_value,
+        )
+        if policy is not None and act_processed_policy is not None:
+            _log_policy_action_flow(act_processed_policy, robot_action_to_send)
+        if "j7" in robot_action_to_send:
+            observation_grip_value = float(robot_action_to_send["j7"])
+
+        robot.send_action(robot_action_to_send)
 
         seq_id = robot.seq_id - 1
         pending.add(seq_id)
@@ -674,153 +468,180 @@ def record_loop(
         if len(pending) >= BUFFER_SIZE:
             time.sleep(INTER_PACKET_DELAY)
 
-        _advance_sample_deadline(time.perf_counter())
-
-        # 数据集保存
         if record_data and dataset is not None:
-            if teleop is not None and not observation_frame:
-                obs = robot.get_observation()
-                if observation_grip_value is not None:
-                    obs["j7"] = observation_grip_value
-                observation_frame = build_dataset_frame(dataset.features, obs, prefix=OBS_STR)
-
-            action_frame = build_dataset_frame(dataset.features, action_to_save, prefix=ACTION)
+            action_frame = build_dataset_frame(dataset.features, robot_action_to_send, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
 
-        if start_episode_t is not None:
-            timestamp = time.perf_counter() - start_episode_t
+        timestamp = time.perf_counter() - start_episode_t
 
         now = time.perf_counter()
-        if episode_started and now - last_diagnostic_time >= diagnostic_interval_s:
+        if now - last_diagnostic_time >= diagnostic_interval_s:
             actual_fps = action_sent_count / timestamp if timestamp > 0 else 0
 
-            print(f"[FPS] t={timestamp:.1f}s actual={actual_fps:.2f}fps target={fps} sent={action_sent_count}")
+            print(
+                f"[FPS] t={timestamp:.1f}s actual={actual_fps:.2f}fps target={fps} "
+                f"sent={action_sent_count} pending={len(pending)} skipped_buffer={action_skipped_buffer_full}"
+            )
 
             last_diagnostic_time = now
 
 @parser.wrap()
 def record(cfg: RecordConfig) -> sLerobotDataset:
-        init_logging()
-        # logging.info(pformat(asdict(cfg)))
-        # logging.info(f"[TELEOP CFG] type={type(cfg.teleop)}, value={cfg.teleop}")
+    init_logging()
 
-        
-        # Initialize Fanuc robot with configuration
-        robot = Fanuc(
-            host=cfg.robot.host,
-            port=cfg.robot.port,
-            group=cfg.robot.group,
-            utool=cfg.robot.utool,
-            uframe=cfg.robot.uframe,
-            speed=cfg.robot.speed,
-            term_type=cfg.robot.term_type,
-            term_value=cfg.robot.term_value,
-            gripper_port_number=cfg.robot.gripper_state_port_number,
-        )
-        # Store cameras config if provided
-        if cfg.robot.cameras is not None:
-            robot.cameras = make_cameras_from_configs(cfg.robot.cameras)
-        
-        # Initialize Quest3s teleoperator if configured
-        if cfg.teleop is not None:
-            # Check if teleop config has specific parameters
-            if hasattr(cfg.teleop, "mqtt_broker"):
-                teleop = Quest3sController(
-                    mqtt_broker=cfg.teleop.mqtt_broker,
-                    mqtt_port=getattr(cfg.teleop, "mqtt_port", 1883),
-                    mqtt_topic=getattr(cfg.teleop, "mqtt_topic", "quest/data"),
-                )
-            else:
-                # Use default Quest3s settings if config is just True or a simple object
-                teleop = Quest3sController()
+    robot = Fanuc(
+        host=cfg.robot.host,
+        port=cfg.robot.port,
+        group=cfg.robot.group,
+        utool=cfg.robot.utool,
+        uframe=cfg.robot.uframe,
+        speed=cfg.robot.speed,
+        term_type=cfg.robot.term_type,
+        term_value=cfg.robot.term_value,
+        gripper_port_number=cfg.robot.gripper_state_port_number,
+    )
+    if cfg.robot.cameras is not None:
+        robot.cameras = make_cameras_from_configs(cfg.robot.cameras)
+
+    if cfg.teleop is not None:
+        if hasattr(cfg.teleop, "mqtt_broker"):
+            teleop = Quest3sController(
+                mqtt_broker=cfg.teleop.mqtt_broker,
+                mqtt_port=getattr(cfg.teleop, "mqtt_port", 1883),
+                mqtt_topic=getattr(cfg.teleop, "mqtt_topic", "quest/data"),
+            )
         else:
-            teleop = None
+            teleop = Quest3sController()
+    else:
+        teleop = None
 
-        policy = None
-        policy_stats = None
-        if cfg.policy is not None:
-            if cfg.policy.pretrained_path is None:
-                raise ValueError("Policy config is missing `pretrained_path`. Please pass `--policy.path=...`.")
+    policy = None
+    preprocessor = None
+    postprocessor = None
+    if cfg.policy is not None:
+        if cfg.policy.pretrained_path is None:
+            raise ValueError("Policy config is missing `pretrained_path`. Please pass `--policy.path=...`.")
 
-            if cfg.policy.type == "act":
-                from slerobot.policies.act.modeling_act import ACTPolicy
+        if cfg.policy.type == "act":
+            from slerobot.policies.act.modeling_act import ACTPolicy
 
-                policy = ACTPolicy.from_pretrained(
-                    pretrained_name_or_path=cfg.policy.pretrained_path,
-                    config=cfg.policy,
+            policy = ACTPolicy.from_pretrained(
+                pretrained_name_or_path=cfg.policy.pretrained_path,
+                config=cfg.policy,
+            )
+            preprocessor = PolicyProcessorPipeline.from_pretrained(
+                cfg.policy.pretrained_path,
+                config_filename="policy_preprocessor.json",
+            )
+            postprocessor = PolicyProcessorPipeline.from_pretrained(
+                cfg.policy.pretrained_path,
+                config_filename="policy_postprocessor.json",
+                to_transition=policy_action_to_transition,
+                to_output=transition_to_policy_action,
+            )
+            _log_processor_pipeline("POLICY_PREPROCESSOR", preprocessor)
+            _log_processor_pipeline("POLICY_POSTPROCESSOR", postprocessor)
+        else:
+            raise ValueError(f"Unsupported policy type for recording: {cfg.policy.type}")
+
+    dataset_features = combine_feature_dicts(robot.observation_features, robot.action_features)
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+
+    dataset = None
+    listener = None
+    events = None
+
+    try:
+        if cfg.resume:
+            dataset = sLerobotDataset(
+                repo_id=cfg.dataset.repo_id,
+                root_dir=cfg.dataset.root,
+                batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                vcodec=cfg.dataset.vcodec,
+                streaming_encoding=cfg.dataset.streaming_encoding,
+                encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                encoder_threads=cfg.dataset.encoder_threads,
+            )
+            if hasattr(robot, "cameras") and len(robot.cameras) > 0:
+                dataset.start_image_writer(
+                    num_processes=cfg.dataset.num_image_writer_process,
+                    num_threads_per_camera=cfg.dataset.num_image_write_threads_per_camera * len(robot.cameras),
                 )
-                policy_stats = _load_policy_dataset_stats(cfg.policy)
-            else:
-                raise ValueError(f"Unsupported policy type for recording: {cfg.policy.type}")
+        else:
+            num_cameras = len(robot.cameras) if hasattr(robot, "cameras") and robot.cameras else 1
 
-        dataset_features = combine_feature_dicts(
-            robot.observation_features,
-            robot.action_features,
-        ) # [ TODO: implement the feature combination logic in slerobot.datasets.utils]
+            dataset = sLerobotDataset.create(
+                cfg.dataset.repo_id,
+                cfg.dataset.fps,
+                root=cfg.dataset.root,
+                robot_type=getattr(robot, "name", "fanuc"),
+                features=dataset_features,
+                use_videos=cfg.dataset.video,
+                image_writer_processes=cfg.dataset.num_image_writer_process,
+                image_writer_threads=cfg.dataset.num_image_write_threads_per_camera * num_cameras,
+                batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                vcodec=cfg.dataset.vcodec,
+                streaming_encoding=cfg.dataset.streaming_encoding,
+                encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                encoder_threads=cfg.dataset.encoder_threads,
+            )
 
+        robot.connect()
 
-        dataset = None
-        listener = None
-        events = None
-        
-        try:
-            if cfg.resume:
-                dataset = sLerobotDataset(
-                    repo_id=cfg.dataset.repo_id,
-                    root_dir=cfg.dataset.root,
-                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                    vcodec=cfg.dataset.vcodec,
-                    streaming_encoding=cfg.dataset.streaming_encoding,
-                    encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
-                    encoder_threads=cfg.dataset.encoder_threads,
-                )
-                if hasattr(robot,"cameras") and len(robot.cameras) > 0:
-                    dataset.start_image_writer(
-                        num_processes=cfg.dataset.num_image_writer_process,
-                        num_threads_per_camera=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
-                    )
-            else:
-                # Get number of cameras for proper thread allocation
-                num_cameras = len(robot.cameras) if hasattr(robot, "cameras") and robot.cameras else 1
-                
-                dataset = sLerobotDataset.create(
-                    cfg.dataset.repo_id,
-                    cfg.dataset.fps,
-                    root=cfg.dataset.root,
-                    robot_type=getattr(robot, "name", "fanuc"),
-                    features=dataset_features,
-                    use_videos=cfg.dataset.video,
-                    image_writer_processes=cfg.dataset.num_image_writer_process,
-                    image_writer_threads=cfg.dataset.num_image_write_threads_per_camera * num_cameras,
-                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                    vcodec=cfg.dataset.vcodec,
-                    streaming_encoding=cfg.dataset.streaming_encoding,
-                    encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
-                    encoder_threads=cfg.dataset.encoder_threads,
-                )
+        for camera in robot.cameras.values():
+            camera.connect()
 
-            robot.connect()
-            
-            # Connect cameras if configured
-            for camera in robot.cameras.values():
-                camera.connect()
-            
-            if teleop is not None:
-                teleop.connect()
-                time.sleep(2.0)
+        if teleop is not None:
+            teleop.connect()
+            time.sleep(2.0)
 
-            listener, events = init_keyboard_listener()
+        listener, events = init_keyboard_listener()
 
-            if not cfg.dataset.streaming_encoding:
-                logging.info(
+        if not cfg.dataset.streaming_encoding:
+            logging.info(
                 "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
             )
 
-            with VideoEncodingManager(dataset):
-                recorded_episodes = 0
-                while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                    log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+        with VideoEncodingManager(dataset):
+            recorded_episodes = 0
+            while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                log_say(f"Recording episode {recorded_episodes + 1}", cfg.play_sounds)
+                record_loop(
+                    robot=robot,
+                    teleop=teleop,
+                    policy=policy,
+                    dataset=dataset,
+                    events=events,
+                    fps=cfg.dataset.fps,
+                    teleop_action_processor=teleop_action_processor,
+                    robot_action_processor=robot_action_processor,
+                    robot_observation_processor=robot_observation_processor,
+                    control_time_s=cfg.dataset.episode_time_s,
+                    single_task=cfg.dataset.single_task,
+                    display_data=cfg.display_data,
+                    display_compressed_images=cfg.display_compressed_images,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    robot_speed=cfg.robot.speed,
+                    robot_term_type=cfg.robot.term_type,
+                    robot_term_value=cfg.robot.term_value,
+                    gripper_lcb_type=cfg.robot.gripper_lcb_type,
+                    gripper_lcb_value=cfg.robot.gripper_lcb_value,
+                    gripper_port_type=cfg.robot.gripper_port_type,
+                    gripper_port_number=cfg.robot.gripper_port_number,
+                    gripper_open_port_number=cfg.robot.gripper_open_port_number,
+                    gripper_close_port_number=cfg.robot.gripper_close_port_number,
+                    gripper_open_value=cfg.robot.gripper_open_value,
+                    gripper_close_value=cfg.robot.gripper_close_value,
+                    record_data=True,
+                )
+
+                if not events["stop_recording"] and (
+                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                ):
+                    log_say("Reset the environment", cfg.play_sounds)
+
                     record_loop(
                         robot=robot,
                         teleop=teleop,
@@ -828,10 +649,15 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                         dataset=dataset,
                         events=events,
                         fps=cfg.dataset.fps,
-                        control_time_s=cfg.dataset.episode_time_s,
+                        teleop_action_processor=teleop_action_processor,
+                        robot_action_processor=robot_action_processor,
+                        robot_observation_processor=robot_observation_processor,
+                        control_time_s=cfg.dataset.reset_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                         display_compressed_images=cfg.display_compressed_images,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
                         robot_speed=cfg.robot.speed,
                         robot_term_type=cfg.robot.term_type,
                         robot_term_value=cfg.robot.term_value,
@@ -843,79 +669,46 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                         gripper_close_port_number=cfg.robot.gripper_close_port_number,
                         gripper_open_value=cfg.robot.gripper_open_value,
                         gripper_close_value=cfg.robot.gripper_close_value,
-                        policy_stats=policy_stats,
-                        record_data=True,
+                        record_data=False,
                     )
 
-                    if not events["stop_recording"] and (
-                        (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                    ):
-                        log_say("Reset the environment", cfg.play_sounds)
+                if events["rerecord_episode"]:
+                    log_say("Re-record episode", cfg.play_sounds)
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    dataset.clear_episode_buffer()
+                    continue
 
-                        record_loop(
-                            robot=robot,
-                            teleop=teleop,
-                            policy=policy,
-                            dataset=dataset,
-                            events=events,
-                            fps=cfg.dataset.fps,
-                            control_time_s=cfg.dataset.reset_time_s,
-                            single_task=cfg.dataset.single_task,
-                            display_data=cfg.display_data,
-                            display_compressed_images=cfg.display_compressed_images,
-                            robot_speed=cfg.robot.speed,
-                            robot_term_type=cfg.robot.term_type,
-                            robot_term_value=cfg.robot.term_value,
-                            gripper_lcb_type=cfg.robot.gripper_lcb_type,
-                            gripper_lcb_value=cfg.robot.gripper_lcb_value,
-                            gripper_port_type=cfg.robot.gripper_port_type,
-                            gripper_port_number=cfg.robot.gripper_port_number,
-                            gripper_open_port_number=cfg.robot.gripper_open_port_number,
-                            gripper_close_port_number=cfg.robot.gripper_close_port_number,
-                            gripper_open_value=cfg.robot.gripper_open_value,
-                            gripper_close_value=cfg.robot.gripper_close_value,
-                            policy_stats=policy_stats,
-                            record_data=False,
-                        )
+                dataset.save_episode()
+                recorded_episodes += 1
+    finally:
+        log_say("Stop recording", cfg.play_sounds, blocking=True)
 
-                    if events["rerecord_episode"]:
-                        log_say("Re-record episode", cfg.play_sounds)
-                        events["rerecord_episode"] = False
-                        events["exit_early"] = False
-                        dataset.clear_episode_buffer()
-                        continue
+        if dataset:
+            dataset.finalize()
 
-                    dataset.save_episode()
-                    recorded_episodes += 1
-        finally:
-            log_say("Stop recording", cfg.play_sounds, blocking=True)
+        for camera in robot.cameras.values():
+            try:
+                camera.disconnect()
+            except Exception as e:
+                logging.warning(f"Failed to disconnect camera: {e}")
 
-            if dataset:
-                dataset.finalize()
-            
-            # Disconnect cameras
-            for camera in robot.cameras.values():
-                try:
-                    camera.disconnect()
-                except Exception as e:
-                    logging.warning(f"Failed to disconnect camera: {e}")
-            
-            if robot.is_connected:
-                robot.disconnect()
+        if robot.is_connected:
+            robot.disconnect()
 
-            if teleop and teleop.is_connected:
-                teleop.disconnect()
-            
-            if listener is not None and not is_headless():
-                listener.stop()
+        if teleop and teleop.is_connected:
+            teleop.disconnect()
 
-            if dataset is not None and cfg.dataset.push_to_hub:
-                dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private) 
-            log_say("Exiting, goodbye!", cfg.play_sounds)
+        if listener is not None and not is_headless():
+            listener.stop()
 
-        return dataset
+        if dataset is not None and cfg.dataset.push_to_hub:
+            dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+        log_say("Exiting, goodbye!", cfg.play_sounds)
+
+    return dataset
 
     
 
 if __name__ == "__main__":
-        record()
+    record()

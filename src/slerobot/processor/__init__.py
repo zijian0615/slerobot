@@ -5,7 +5,7 @@ This module defines the fundamental types and utilities for processing
 robot actions and observations in the LeRobot FANUC system.
 """
 
-from typing import Any
+from typing import Any, TypeAlias
 #from .batch_processor import AddBatchDimensionProcessorStep
 from .converters import (
     batch_to_transition,
@@ -21,13 +21,13 @@ from .core import (
     TransitionKey,
 )
 from .delta_action_processor import MapDeltaActionToRobotActionStep, MapTensorToDeltaActionDictStep
-#from .device_processor import DeviceProcessorStep
-# from .factory import (
-#     make_default_processors,
-#     make_default_robot_action_processor,
-#     make_default_robot_observation_processor,
-#     make_default_teleop_action_processor,
-# )
+from .device_processor import DeviceProcessorStep
+from .factory import (
+    make_default_processors,
+    make_default_robot_action_processor,
+    make_default_robot_observation_processor,
+    make_default_teleop_action_processor,
+)
 # from .gym_action_processor import (
 #     Numpy2TorchActionProcessorStep,
 #     Torch2NumpyActionProcessorStep,
@@ -42,26 +42,28 @@ from .delta_action_processor import MapDeltaActionToRobotActionStep, MapTensorTo
 #     RewardClassifierProcessorStep,
 #     TimeLimitProcessorStep,
 # )
-# from .normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep, hotswap_stats
+from .normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep
 # from .observation_processor import VanillaObservationProcessorStep
 from .pipeline import (
     ActionProcessorStep,
     #ComplementaryDataProcessorStep,
-    #DataProcessorPipeline,
+    DataProcessorPipeline,
     #DoneProcessorStep,
-    #IdentityProcessorStep,
+    IdentityProcessorStep,
     #InfoProcessorStep,
     #ObservationProcessorStep,
     PolicyActionProcessorStep,
-    #PolicyProcessorPipeline,
+    PolicyProcessorPipeline,
     #ProcessorKwargs,
-    #ProcessorStep,
-    #ProcessorStepRegistry,
+    ProcessorStep,
+    ProcessorStepRegistry,
     #RewardProcessorStep,
     RobotActionProcessorStep,
-    #RobotProcessorPipeline,
+    RobotProcessorPipeline,
     #TruncatedProcessorStep,
 )
+from .rename_processor import RenameObservationsProcessorStep
+from .to_batch_processor import ToBatchProcessorStep
 # from .policy_robot_bridge import (
 #     PolicyActionToRobotActionProcessorStep,
 #     RobotActionToPolicyActionProcessorStep,
@@ -69,10 +71,10 @@ from .pipeline import (
 # from .rename_processor import RenameObservationsProcessorStep
 # from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
 # Type alias for robot actions (dict with arbitrary keys and values)
-RobotAction = dict[str, Any]
+RobotAction: TypeAlias = dict[str, Any]
 
 # Type alias for robot observations (dict with arbitrary keys and values)
-RobotObservation = dict[str, Any]
+RobotObservation: TypeAlias = dict[str, Any]
 
 __all__ = [
     "ActionProcessorStep",

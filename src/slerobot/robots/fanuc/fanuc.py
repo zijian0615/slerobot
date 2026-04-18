@@ -47,6 +47,7 @@ class Fanuc(Robot):
         self._latest_t: Optional[float] = None
         self._latest_tick: Optional[int] = None
         self._latest_configuration: Optional[Dict] = None
+        self._motion_configuration: Optional[Dict] = None
         self._latest_gripper_state: Optional[int] = None
 
         # seq_id -> Future[int]，接收线程写入，发送方读取
@@ -87,7 +88,7 @@ class Fanuc(Robot):
             raise RuntimeError(f"FRC_Initialize failed: {resp}")
 
         self._set_uframe_utool(self._uframe, self._utool)
-        self._latest_configuration = {
+        self._motion_configuration = {
             "UToolNumber": self._utool,
             "UFrameNumber": self._uframe,
             "Front": 1,
@@ -98,6 +99,7 @@ class Fanuc(Robot):
             "Turn5": 0,
             "Turn6": 0,
         }
+        self._latest_configuration = dict(self._motion_configuration)
         self._connected = True
 
         # 启动后台接收线程
@@ -171,13 +173,20 @@ class Fanuc(Robot):
             results = [f.result(timeout=30.0) for f in futs]
         """
         self._require_connected()
+        if self._motion_configuration is None:
+            self._motion_configuration = {
+                "UToolNumber": self._utool,
+                "UFrameNumber": self._uframe,
+                "Front": 1,
+                "Up": 1,
+                "Left": 0,
+                "Flip": 0,
+                "Turn4": 0,
+                "Turn5": 0,
+                "Turn6": 0,
+            }
         if self._latest_configuration is None:
-            self._latest_configuration = {
-            "UToolNumber": self._utool,
-            "UFrameNumber": self._uframe,
-            "Front": 1, "Up": 1, "Left": 0,
-            "Flip": 0, "Turn4": 0, "Turn5": 0, "Turn6": 0,
-        }
+            self._latest_configuration = dict(self._motion_configuration)
 
         # Support multiple action formats
         # New format: {"j0": x, "j1": y, "j2": z, "j3": w, "j4": p, "j5": r} (from dataset)
@@ -199,7 +208,18 @@ class Fanuc(Robot):
                 raise ValueError(f"Invalid state format. Expected 6 values, got {len(state)}")
         elif "position" in action:
             position = action["position"]
-            if len(position) == 6:
+            if isinstance(position, dict):
+                rotation = action.get("rotation")
+                if not isinstance(rotation, dict):
+                    raise ValueError("When 'position' is a dict, 'rotation' must also be a dict")
+
+                x = float(position["x"])
+                y = float(position["y"])
+                z = float(position["z"])
+                w = float(rotation["w"])
+                p = float(rotation["p"])
+                r = float(rotation["r"])
+            elif len(position) == 6:
                 # Old format: unpack all 6 values from position
                 x, y, z, w, p, r = position
             elif len(position) == 3:
@@ -211,7 +231,7 @@ class Fanuc(Robot):
         else:
             raise ValueError("Action must contain 'j0'-'j5', 'state', or 'position' key")
 
-        configuration = dict(self._latest_configuration or {})
+        configuration = dict(self._motion_configuration or {})
         configuration.update(
             {
                 "UToolNumber": int(action.get("utool", configuration.get("UToolNumber", self._utool))),
@@ -225,6 +245,7 @@ class Fanuc(Robot):
                 "Turn6": int(action.get("turn6", configuration.get("Turn6", 0))),
             }
         )
+        self._motion_configuration = dict(configuration)
 
         seq_id = self.seq_id
         self.seq_id += 1
