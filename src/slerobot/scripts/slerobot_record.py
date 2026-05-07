@@ -17,8 +17,10 @@ from slerobot.datasets.slerobot_datasets import sLerobotDataset
 from slerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
 from slerobot.datasets.video_utils import VideoEncodingManager
 
+
 from slerobot.policies.pretrained import PreTrainedPolicy
 from slerobot.policies.utils import make_robot_action
+from slerobot.policies.factory import get_policy_class, make_pre_post_processors
 
 from slerobot.utils.control_utils import init_keyboard_listener, is_headless, predict_action
 from slerobot.utils.robot_utils import decode_fanuc_pose_dict, encode_fanuc_pose_dict
