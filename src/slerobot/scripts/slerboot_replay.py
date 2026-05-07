@@ -8,7 +8,7 @@ from slerobot.configs import parser
 from slerobot.datasets.slerobot_datasets import sLerobotDataset
 from slerobot.robots.fanuc import Fanuc
 from slerobot.utils.control_utils import init_keyboard_listener, is_headless
-from slerobot.utils.robot_utils import precise_sleep
+from slerobot.utils.robot_utils import decode_fanuc_pose_dict, precise_sleep
 from slerobot.utils.utils import init_logging, log_say
 
 
@@ -84,17 +84,14 @@ def _build_action_dict(action_names: list[str], action_values: Any) -> dict[str,
 
 
 def _build_robot_action(action_dict: dict[str, float], cfg: FanucReplayConfig) -> dict[str, Any]:
-	robot_action = {
-		"j0": float(action_dict.get("j0", 0.0)),
-		"j1": float(action_dict.get("j1", 0.0)),
-		"j2": float(action_dict.get("j2", 0.0)),
-		"j3": float(action_dict.get("j3", 0.0)),
-		"j4": float(action_dict.get("j4", 0.0)),
-		"j5": float(action_dict.get("j5", 0.0)),
-		"speed": cfg.speed,
-		"term_type": cfg.term_type,
-		"term_value": cfg.term_value,
-	}
+	robot_action = decode_fanuc_pose_dict(action_dict)
+	robot_action.update(
+		{
+			"speed": cfg.speed,
+			"term_type": cfg.term_type,
+			"term_value": cfg.term_value,
+		}
+	)
 
 	grip_value = float(action_dict.get("j7", 0.0))
 	grip_pressed = int(grip_value >= 0.5)

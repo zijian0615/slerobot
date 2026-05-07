@@ -24,7 +24,11 @@ from huggingface_hub.errors import RevisionNotFoundError
 from PIL import Image as PILImage
 from torchvision import transforms
 
+
+from slerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STR
+from slerobot.configs.types import FeatureType, PolicyFeature
 from slerobot.utils.utils import SuppressProgressBars, is_valid_numpy_dtype_string
+from slerobot.utils.robot_utils import encode_fanuc_pose_dict
 from slerobot.datasets.backward_compatibility import (
     FUTURE_MESSAGE,
     BackwardCompatibilityError,
@@ -1153,20 +1157,23 @@ def convert_quest3s_to_fanuc_action(quest_action: dict, speed: int | None = None
     Returns:
         Dictionary with Fanuc robot format including optional control parameters:
             {
-                "j0": x, "j1": y, "j2": z, "j3": w, "j4": p, "j5": r,
+                "j0": x, "j1": y, "j2": z,
+                "j3_sin": ..., "j3_cos": ..., "j4_sin": ..., "j4_cos": ..., "j5_sin": ..., "j5_cos": ...,
+                "j7": grip,
                 "speed": speed,           # if provided
                 "term_type": term_type,   # if provided
                 "term_value": term_value  # if provided
             }
     """
-    action = {
+    action = encode_fanuc_pose_dict({
         "j0": quest_action["position"]["x"],
         "j1": quest_action["position"]["y"],
         "j2": quest_action["position"]["z"],
         "j3": quest_action["rotation"]["w"],
         "j4": quest_action["rotation"]["p"],
         "j5": quest_action["rotation"]["r"],
-    }
+        "j7": float(bool(quest_action.get("buttons", {}).get("grip", 0))),
+    })
     
     # Add control parameters if provided
     if speed is not None:
@@ -1195,3 +1202,48 @@ def convert_quest3s_to_fanuc_action(quest_action: dict, speed: int | None = None
 #     """
 #     pass
     #return out
+
+def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFeature]:
+    """Convert dataset features to policy features.
+
+    This function transforms the dataset's feature specification into a format
+    that a policy can use, classifying features by type (e.g., visual, state,
+    action) and ensuring correct shapes (e.g., channel-first for images).
+
+    Args:
+        features (dict): The LeRobot dataset features dictionary.
+
+    Returns:
+        dict: A dictionary mapping feature keys to `PolicyFeature` objects.
+
+    Raises:
+        ValueError: If an image feature does not have a 3D shape.
+    """
+    # TODO(aliberts): Implement "type" in dataset features and simplify this
+    policy_features = {}
+    for key, ft in features.items():
+        shape = ft["shape"]
+        if ft["dtype"] in ["image", "video"]:
+            type = FeatureType.VISUAL
+            if len(shape) != 3:
+                raise ValueError(f"Number of dimensions of {key} != 3 (shape={shape})")
+
+            names = ft["names"]
+            # Backward compatibility for "channel" which is an error introduced in LeRobotDataset v2.0 for ported datasets.
+            if names[2] in ["channel", "channels"]:  # (h, w, c) -> (c, h, w)
+                shape = (shape[2], shape[0], shape[1])
+        elif key == OBS_ENV_STATE:
+            type = FeatureType.ENV
+        elif key.startswith(OBS_STR):
+            type = FeatureType.STATE
+        elif key.startswith(ACTION):
+            type = FeatureType.ACTION
+        else:
+            continue
+
+        policy_features[key] = PolicyFeature(
+            type=type,
+            shape=shape,
+        )
+
+    return policy_features

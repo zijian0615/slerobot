@@ -21,6 +21,7 @@ from slerobot.policies.pretrained import PreTrainedPolicy
 from slerobot.policies.utils import make_robot_action
 
 from slerobot.utils.control_utils import init_keyboard_listener, is_headless, predict_action
+from slerobot.utils.robot_utils import decode_fanuc_pose_dict, encode_fanuc_pose_dict
 from slerobot.utils.utils import get_safe_torch_device, init_logging, log_say
 
 from slerobot.processor import (
@@ -211,6 +212,11 @@ def _apply_robot_action_metadata(
 ) -> RobotAction:
     robot_action = dict(action)
 
+    if "j7" not in robot_action:
+        buttons = robot_action.get("buttons")
+        if isinstance(buttons, dict) and "grip" in buttons:
+            robot_action["j7"] = float(bool(buttons.get("grip", 0)))
+
     if robot_speed is not None:
         robot_action.setdefault("speed", robot_speed)
     if robot_term_type is not None:
@@ -385,6 +391,7 @@ def record_loop(
         act_processed_policy: RobotAction | None = None
         act_processed_teleop: RobotAction | None = None
         action_values: RobotAction | PolicyAction | None = None
+        encoded_action_values: RobotAction | None = None
 
         if policy is not None and preprocessor is not None and postprocessor is not None and record_data:
             robot_type = getattr(robot, "robot_type", getattr(robot, "name", robot.__class__.__name__.lower()))
@@ -433,11 +440,13 @@ def record_loop(
         no_action_count = 0
 
         if policy is not None and act_processed_policy is not None:
-            action_values = act_processed_policy
-            robot_action_to_send = robot_action_processor((act_processed_policy, obs))
+            encoded_action_values = encode_fanuc_pose_dict(act_processed_policy)
+            action_values = encoded_action_values
+            robot_action_to_send = robot_action_processor((decode_fanuc_pose_dict(encoded_action_values), obs))
         else:
-            action_values = act_processed_teleop
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+            encoded_action_values = encode_fanuc_pose_dict(act_processed_teleop or {})
+            action_values = encoded_action_values
+            robot_action_to_send = robot_action_processor((decode_fanuc_pose_dict(encoded_action_values), obs))
 
         robot_action_to_send = _apply_robot_action_metadata(
             robot_action_to_send,
@@ -469,7 +478,10 @@ def record_loop(
             time.sleep(INTER_PACKET_DELAY)
 
         if record_data and dataset is not None:
-            action_frame = build_dataset_frame(dataset.features, robot_action_to_send, prefix=ACTION)
+            action_frame_values = dict(encoded_action_values or {})
+            if "j7" in robot_action_to_send:
+                action_frame_values["j7"] = float(robot_action_to_send["j7"])
+            action_frame = build_dataset_frame(dataset.features, action_frame_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
 
@@ -523,27 +535,21 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
         if cfg.policy.pretrained_path is None:
             raise ValueError("Policy config is missing `pretrained_path`. Please pass `--policy.path=...`.")
 
-        if cfg.policy.type == "act":
-            from slerobot.policies.act.modeling_act import ACTPolicy
-
-            policy = ACTPolicy.from_pretrained(
+        try:
+            policy_cls = get_policy_class(cfg.policy.type)
+            policy = policy_cls.from_pretrained(
                 pretrained_name_or_path=cfg.policy.pretrained_path,
                 config=cfg.policy,
             )
-            preprocessor = PolicyProcessorPipeline.from_pretrained(
-                cfg.policy.pretrained_path,
-                config_filename="policy_preprocessor.json",
-            )
-            postprocessor = PolicyProcessorPipeline.from_pretrained(
-                cfg.policy.pretrained_path,
-                config_filename="policy_postprocessor.json",
-                to_transition=policy_action_to_transition,
-                to_output=transition_to_policy_action,
+            preprocessor, postprocessor = make_pre_post_processors(
+                policy_cfg=cfg.policy,
+                pretrained_path=str(cfg.policy.pretrained_path),
             )
             _log_processor_pipeline("POLICY_PREPROCESSOR", preprocessor)
             _log_processor_pipeline("POLICY_POSTPROCESSOR", postprocessor)
-        else:
+        except Exception as e:
             raise ValueError(f"Unsupported policy type for recording: {cfg.policy.type}")
+            
 
     dataset_features = combine_feature_dicts(robot.observation_features, robot.action_features)
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
@@ -556,7 +562,7 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
         if cfg.resume:
             dataset = sLerobotDataset(
                 repo_id=cfg.dataset.repo_id,
-                root_dir=cfg.dataset.root,
+                root=cfg.dataset.root,
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                 vcodec=cfg.dataset.vcodec,
                 streaming_encoding=cfg.dataset.streaming_encoding,
@@ -566,7 +572,7 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
             if hasattr(robot, "cameras") and len(robot.cameras) > 0:
                 dataset.start_image_writer(
                     num_processes=cfg.dataset.num_image_writer_process,
-                    num_threads_per_camera=cfg.dataset.num_image_write_threads_per_camera * len(robot.cameras),
+                    num_threads=cfg.dataset.num_image_write_threads_per_camera * len(robot.cameras),
                 )
         else:
             num_cameras = len(robot.cameras) if hasattr(robot, "cameras") and robot.cameras else 1

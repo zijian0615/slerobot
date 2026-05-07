@@ -13,6 +13,7 @@
 # limitations under the License.
 import abc
 import builtins
+import importlib
 import json
 import os
 import tempfile
@@ -35,6 +36,17 @@ from slerobot.utils.utils import auto_select_torch_device, is_amp_available, is_
 
 T = TypeVar("T", bound="PreTrainedConfig")
 logger = getLogger(__name__)
+
+
+def _ensure_builtin_policy_configs_registered() -> None:
+    """Import built-in policy config modules so draccus choice registry is populated."""
+    builtin_modules = (
+        "slerobot.policies.act.configuration_act",
+        "slerobot.policies.diffusion.configuration_diffusion",
+    )
+
+    for module_name in builtin_modules:
+        importlib.import_module(module_name)
 
 
 @dataclass
@@ -178,6 +190,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         revision: str | None = None,
         **policy_kwargs: Any,
     ) -> T:
+        _ensure_builtin_policy_configs_registered()
+
         model_id = str(pretrained_name_or_path)
         config_file: str | None = None
         if Path(model_id).is_dir():

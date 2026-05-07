@@ -8,6 +8,7 @@ from concurrent.futures import Future
 from typing import Dict, Optional, Tuple
 
 from slerobot.cameras.utils import make_cameras_from_configs
+from slerobot.utils.robot_utils import decode_fanuc_pose_dict, encode_fanuc_pose_dict
 from ..robot import Robot
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ class Fanuc(Robot):
         self._latest_configuration: Optional[Dict] = None
         self._motion_configuration: Optional[Dict] = None
         self._latest_gripper_state: Optional[int] = None
+        self._orientation_debug_count: int = 0
 
         # seq_id -> Future[int]，接收线程写入，发送方读取
         self._pending_futures: Dict[int, Future] = {}
@@ -171,6 +173,12 @@ class Fanuc(Robot):
         若需流水线发送，可先堆积多条指令再统一等待：
             futs = [robot.send_action(a) for a in actions]
             results = [f.result(timeout=30.0) for f in futs]
+
+        支持两类末端姿态动作格式：
+            1. 直接角度：`j3`/`j4`/`j5`
+            2. 连续表示：`j3_sin`/`j3_cos`、`j4_sin`/`j4_cos`、`j5_sin`/`j5_cos`
+
+        当传入连续表示时，会在发送给 FANUC 前自动解码回 `W/P/R` 角度。
         """
         self._require_connected()
         if self._motion_configuration is None:
@@ -189,9 +197,31 @@ class Fanuc(Robot):
             self._latest_configuration = dict(self._motion_configuration)
 
         # Support multiple action formats
-        # New format: {"j0": x, "j1": y, "j2": z, "j3": w, "j4": p, "j5": r} (from dataset)
+        # New format: {"j0": x, "j1": y, "j2": z, "j3_sin": ..., "j3_cos": ..., ...} (from dataset)
         # Legacy format: {"state": (x, y, z, w, p, r)} or {"position": (...), "rotation": (...)}
         if "j0" in action and "j1" in action:
+            raw_action = dict(action)
+            action = decode_fanuc_pose_dict(action)
+            if self._orientation_debug_count < 10 and any(key.endswith(("_sin", "_cos")) for key in raw_action):
+                logger.info(
+                    "[FANUC_DECODED_ORIENTATION] encoded=%s decoded={j3=%.4f, j4=%.4f, j5=%.4f}",
+                    {
+                        key: raw_action[key]
+                        for key in (
+                            "j3_sin",
+                            "j3_cos",
+                            "j4_sin",
+                            "j4_cos",
+                            "j5_sin",
+                            "j5_cos",
+                        )
+                        if key in raw_action
+                    },
+                    float(action["j3"]),
+                    float(action["j4"]),
+                    float(action["j5"]),
+                )
+                self._orientation_debug_count += 1
             # New format: individual joint values
             x = float(action["j0"])
             y = float(action["j1"])
@@ -297,6 +327,15 @@ class Fanuc(Robot):
         return fut
 
     def get_observation(self) -> Dict:
+        """返回当前机器人观测。
+
+        对外部数据流而言，姿态主表示为连续的 `sin/cos` 形式：
+        `j3_sin/j3_cos`、`j4_sin/j4_cos`、`j5_sin/j5_cos`。
+
+        夹爪状态仍保留为 `j7`。
+
+        同时保留 `j3/j4/j5` 原始角度字段，仅用于内部调试和兼容逻辑。
+        """
         self._require_connected()
         if self._latest_pose is None:
             deadline = time.time() + 1.0
@@ -316,9 +355,6 @@ class Fanuc(Robot):
             "j0": float(x),  # x coordinate
             "j1": float(y),  # y coordinate
             "j2": float(z),  # z coordinate
-            "j3": float(w),  # w (wrist rotation)
-            "j4": float(p),  # p (pitch)
-            "j5": float(r),  # r (roll)
             "j7": (
                 float(self._latest_gripper_state)
                 if self._latest_gripper_state is not None
@@ -329,6 +365,10 @@ class Fanuc(Robot):
             "uframe": self._latest_configuration.get("UFrameNumber") if self._latest_configuration else None,
             "utool": self._latest_configuration.get("UToolNumber") if self._latest_configuration else None,
         }
+        obs.update(encode_fanuc_pose_dict({"j3": float(w), "j4": float(p), "j5": float(r)}))
+        obs["j3"] = float(w)
+        obs["j4"] = float(p)
+        obs["j5"] = float(r)
         if self._gripper_port_number is not None:
             obs["gripper_state"] = (
                 float(self._latest_gripper_state)
@@ -513,7 +553,10 @@ class Fanuc(Robot):
         """Get observation features including arm state and camera images.
         
         Returns a dict where:
-        - Each joint position is a separate float feature (x, y, z, w, p, r)
+                - Position uses `j0`/`j1`/`j2`
+                - Orientation uses continuous representation:
+                    `j3_sin`, `j3_cos`, `j4_sin`, `j4_cos`, `j5_sin`, `j5_cos`
+                - Gripper state uses `j7`
         - Camera names map to their image shapes (height, width, 3)
         
         These will be merged into "observation.state" by combine_feature_dicts.
@@ -522,9 +565,12 @@ class Fanuc(Robot):
             "j0": float,  # x coordinate
             "j1": float,  # y coordinate
             "j2": float,  # z coordinate
-            "j3": float,  # w (wrist rotation)
-            "j4": float,  # p (pitch)
-            "j5": float,  # r (roll)
+            "j3_sin": float,
+            "j3_cos": float,
+            "j4_sin": float,
+            "j4_cos": float,
+            "j5_sin": float,
+            "j5_cos": float,
             "j7": float,  # gripper state
         }
         
@@ -543,7 +589,10 @@ class Fanuc(Robot):
         """Get action features for the arm.
         
         Returns a dict where:
-        - Each joint target is a separate float feature (j0-j5 for x, y, z, w, p, r)
+                - Position uses `j0`/`j1`/`j2`
+                - Orientation uses continuous representation:
+                    `j3_sin`, `j3_cos`, `j4_sin`, `j4_cos`, `j5_sin`, `j5_cos`
+                - Gripper command uses `j7`
         
         These will be merged into "action" by combine_feature_dicts.
         """
@@ -551,9 +600,12 @@ class Fanuc(Robot):
             "j0": float,  # x coordinate
             "j1": float,  # y coordinate
             "j2": float,  # z coordinate
-            "j3": float,  # w (wrist rotation)
-            "j4": float,  # p (pitch)
-            "j5": float,  # r (roll)
+            "j3_sin": float,
+            "j3_cos": float,
+            "j4_sin": float,
+            "j4_cos": float,
+            "j5_sin": float,
+            "j5_cos": float,
             "j7": float,  # gripper command/state
         }
     

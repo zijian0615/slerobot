@@ -24,13 +24,12 @@ import torch
 from typing_extensions import Unpack
 
 from slerobot.configs.policies import PreTrainedConfig
-from slerobot.configs.types import FeatureType
-from slerobot.datasets.slerobot_datasets import LeRobotDatasetMetadata
-from slerobot.datasets.utils import dataset_to_policy_features
+from slerobot.configs.types import FeatureType, PolicyFeature
+from slerobot.datasets.slerobot_datasets import sLerobotDatasetMetadata
 #from lerobot.envs.configs import EnvConfig
 # from lerobot.envs.utils import env_to_policy_features
 from slerobot.policies.act.configuration_act import ACTConfig
-# from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+from slerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 # from lerobot.policies.groot.configuration_groot import GrootConfig
 # from lerobot.policies.pi0.configuration_pi0 import PI0Config
 # from lerobot.policies.pi05.configuration_pi05 import PI05Config
@@ -53,9 +52,55 @@ from slerobot.processor.converters import (
 )
 from slerobot.utils.constants import (
     ACTION,
+    OBS_ENV_STATE,
+    OBS_LANGUAGE,
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_SUBTASK,
+    OBS_LANGUAGE_SUBTASK_ATTENTION_MASK,
+    OBS_LANGUAGE_SUBTASK_TOKENS,
+    OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
+
+
+def dataset_to_policy_features(dataset_features: dict[str, dict[str, Any]]) -> dict[str, PolicyFeature]:
+    """Convert dataset feature metadata into policy feature definitions."""
+    policy_features: dict[str, PolicyFeature] = {}
+
+    language_keys = {
+        OBS_LANGUAGE,
+        OBS_LANGUAGE_TOKENS,
+        OBS_LANGUAGE_ATTENTION_MASK,
+        OBS_LANGUAGE_SUBTASK,
+        OBS_LANGUAGE_SUBTASK_TOKENS,
+        OBS_LANGUAGE_SUBTASK_ATTENTION_MASK,
+    }
+
+    for key, feature in dataset_features.items():
+        if key in {"timestamp", "frame_index", "episode_index", "index", "task_index"}:
+            continue
+
+        shape = tuple(feature.get("shape", ()))
+        dtype = feature.get("dtype")
+
+        if key == ACTION:
+            feature_type = FeatureType.ACTION
+        elif key == OBS_STATE:
+            feature_type = FeatureType.STATE
+        elif key == OBS_ENV_STATE:
+            feature_type = FeatureType.ENV
+        elif key in language_keys:
+            feature_type = FeatureType.LANGUAGE
+        elif key.startswith("observation.images.") or dtype in {"image", "video"}:
+            feature_type = FeatureType.VISUAL
+        else:
+            continue
+
+        policy_features[key] = PolicyFeature(type=feature_type, shape=shape)
+
+    return policy_features
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
@@ -79,8 +124,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from slerobot.policies.act.modeling_act import ACTPolicy
 
         return ACTPolicy
-    # elif name == "diffusion":
-    #     from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
+    elif name == "diffusion":
+        from slerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
+
+        return DiffusionPolicy
 
     #     return DiffusionPolicy
     # elif name == "act":
@@ -159,8 +206,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     """
     if policy_type == "act":
         return ACTConfig(**kwargs)
-    # elif policy_type == "diffusion":
-    #     return DiffusionConfig(**kwargs)
+    elif policy_type == "diffusion":
+        return DiffusionConfig(**kwargs)
     # elif policy_type == "act":
     #     return ACTConfig(**kwargs)
     # elif policy_type == "vqbet":
@@ -293,13 +340,13 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
-    # elif isinstance(policy_cfg, DiffusionConfig):
-    #     from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors
+    elif isinstance(policy_cfg, DiffusionConfig):
+        from slerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors
 
-    #     processors = make_diffusion_pre_post_processors(
-    #         config=policy_cfg,
-    #         dataset_stats=kwargs.get("dataset_stats"),
-    #     )
+        processors = make_diffusion_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
 
     # elif isinstance(policy_cfg, ACTConfig):
     #     from lerobot.policies.act.processor_act import make_act_pre_post_processors
@@ -405,7 +452,7 @@ def make_pre_post_processors(
 
 def make_policy(
     cfg: PreTrainedConfig,
-    ds_meta: LeRobotDatasetMetadata | None = None,
+    ds_meta: sLerobotDatasetMetadata | None = None,
     env_cfg:  None = None,
     rename_map: dict[str, str] | None = None,
 ) -> PreTrainedPolicy:
@@ -414,7 +461,7 @@ def make_policy(
 
     This factory function handles the logic of creating a policy, which requires
     determining the input and output feature shapes. These shapes can be derived
-    either from a `LeRobotDatasetMetadata` object or an `EnvConfig` object. The function
+    either from a `sLerobotDatasetMetadata` object or an `EnvConfig` object. The function
     can either initialize a new policy from scratch or load a pretrained one.
 
     Args:
