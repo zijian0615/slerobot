@@ -28,7 +28,7 @@ from slerobot.datasets.video_utils import VideoEncodingManager
 
 from slerobot.policies.pretrained import PreTrainedPolicy
 from slerobot.policies.utils import make_robot_action
-from slerobot.policies.act.modeling_act import ACTEigenCAMHelper, ACTPolicy, attention_cam_method_display_name
+from slerobot.policies.act.modeling_act import ACTEigenCAMHelper, ACTPolicy
 from slerobot.policies.factory import get_policy_class, make_pre_post_processors
 
 from slerobot.utils.control_utils import init_keyboard_listener, is_headless, predict_action
@@ -168,8 +168,6 @@ class RecordConfig:
         display_port: Port of remote rerun server (default: None)
         display_compressed_images: Whether to display compressed images in Rerun (default: False)
         play_sounds: Whether to use vocal synthesis to read events (default: True)
-        tts_voice: TTS voice name for episode/reset prompts (macOS: `say -v '?'` to list)
-        tts_rate: TTS speaking rate in words per minute (macOS `say -r`, optional)
         resume: Whether to resume recording on an existing dataset (default: False)
         enable_attention_visualization: Whether to capture and save attention visualizations from ACT policy (default: False)
         realtime_attention_display: Whether to display attention visualizations in real-time using Rerun (default: False)
@@ -184,8 +182,6 @@ class RecordConfig:
     display_port: int | None = None
     display_compressed_images: bool = False
     play_sounds: bool = True
-    tts_voice: str | None = None
-    tts_rate: int | None = None
     resume: bool = False
     enable_attention_visualization: bool = False
     realtime_attention_display: bool = False
@@ -345,9 +341,6 @@ def record_loop(
     attention_visualization_enabled: bool = False,
     attention_output_dir: Path | str | None = None,
     realtime_attention_display: bool = False,
-    play_sounds: bool = True,
-    tts_voice: str | None = None,
-    tts_rate: int | None = None,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -433,21 +426,6 @@ def record_loop(
                 robot_type=robot_type,
             )
 
-            if isinstance(policy, ACTPolicy):
-                warning_voice = None
-                if policy.config.warning_speech_voice:
-                    warning_voice = policy.config.warning_speech_voice
-                elif tts_voice:
-                    warning_voice = tts_voice
-                warning_rate = policy.config.warning_speech_rate
-                if warning_rate is None:
-                    warning_rate = tts_rate
-                policy.announce_attention_warnings(
-                    play_sounds=play_sounds,
-                    voice=warning_voice,
-                    rate=warning_rate,
-                )
-
             if (
                 record_data
                 and attention_visualization_enabled
@@ -471,12 +449,7 @@ def record_loop(
                         camera_key = image_key.split(".")[-1]
                         if camera_key not in obs or attn_map is None:
                             continue
-                        overlay_helper = (
-                            policy.attention_overlay_helper
-                            if isinstance(policy, ACTPolicy)
-                            else ACTEigenCAMHelper
-                        )
-                        vis = overlay_helper.overlay_attention_on_image(
+                        vis = ACTEigenCAMHelper.overlay_attention_on_image(
                             obs[camera_key],
                             attn_map,
                             overlay_alpha=0.5,
@@ -600,9 +573,6 @@ def record_loop(
                 grad_cam_edge_margin_px=policy.config.grad_cam_edge_margin_px
                 if isinstance(policy, ACTPolicy)
                 else None,
-                attention_overlay_helper=policy.attention_overlay_helper
-                if isinstance(policy, ACTPolicy)
-                else ACTEigenCAMHelper,
             )
 
         timestamp = time.perf_counter() - start_episode_t
@@ -659,13 +629,7 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
         try:
             policy_cls = get_policy_class(cfg.policy.type)
             if cfg.enable_attention_visualization and cfg.policy.type == "act":
-                cam_name = attention_cam_method_display_name(cfg.policy.attention_cam_method)
-                warning_label = cfg.policy.attention_camera or "all"
-                logging.info(
-                    "Enabling ACT %s on all cameras; ROI warning on: %s",
-                    cam_name,
-                    warning_label,
-                )
+                logging.info("Enabling ACT Eigen-CAM visualization in policy")
                 cfg.policy.enable_attention_visualization = True
                 attention_visualization_enabled = True
 
@@ -779,12 +743,7 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
-                log_say(
-                    f"Recording episode {recorded_episodes + 1}",
-                    cfg.play_sounds,
-                    voice=cfg.tts_voice,
-                    rate=cfg.tts_rate,
-                )
+                log_say(f"Recording episode {recorded_episodes + 1}", cfg.play_sounds)
                 record_loop(
                     robot=robot,
                     teleop=teleop,
@@ -816,20 +775,12 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                     attention_visualization_enabled=attention_visualization_enabled,
                     attention_output_dir=attention_output_dir,
                     realtime_attention_display=cfg.realtime_attention_display,
-                    play_sounds=cfg.play_sounds,
-                    tts_voice=cfg.tts_voice,
-                    tts_rate=cfg.tts_rate,
                 )
 
                 if not events["stop_recording"] and (
                     (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
                 ):
-                    log_say(
-                        "Reset the environment",
-                        cfg.play_sounds,
-                        voice=cfg.tts_voice,
-                        rate=cfg.tts_rate,
-                    )
+                    log_say("Reset the environment", cfg.play_sounds)
 
                     record_loop(
                         robot=robot,
@@ -862,18 +813,10 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                         attention_visualization_enabled=attention_visualization_enabled,
                         attention_output_dir=attention_output_dir,
                         realtime_attention_display=cfg.realtime_attention_display,
-                        play_sounds=cfg.play_sounds,
-                        tts_voice=cfg.tts_voice,
-                        tts_rate=cfg.tts_rate,
                     )
 
                 if events["rerecord_episode"]:
-                    log_say(
-                        "Re-record episode",
-                        cfg.play_sounds,
-                        voice=cfg.tts_voice,
-                        rate=cfg.tts_rate,
-                    )
+                    log_say("Re-record episode", cfg.play_sounds)
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
                     dataset.clear_episode_buffer()
@@ -882,13 +825,7 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                 dataset.save_episode()
                 recorded_episodes += 1
     finally:
-        log_say(
-            "Stop recording",
-            cfg.play_sounds,
-            blocking=True,
-            voice=cfg.tts_voice,
-            rate=cfg.tts_rate,
-        )
+        log_say("Stop recording", cfg.play_sounds, blocking=True)
 
         if dataset:
             dataset.finalize()
@@ -918,7 +855,7 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
 
         if dataset is not None and cfg.dataset.push_to_hub:
             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
-        log_say("Exiting, goodbye!", cfg.play_sounds, voice=cfg.tts_voice, rate=cfg.tts_rate)
+        log_say("Exiting, goodbye!", cfg.play_sounds)
 
     return dataset
 

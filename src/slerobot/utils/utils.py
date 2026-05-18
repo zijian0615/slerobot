@@ -195,23 +195,41 @@ def format_big_number(num, precision=0):
     return num
 
 
-def say(text: str, blocking: bool = False):
+def say(
+    text: str,
+    blocking: bool = False,
+    voice: str | None = None,
+    rate: int | None = None,
+):
     system = platform.system()
 
     if system == "Darwin":
-        cmd = ["say", text]
+        cmd = ["say"]
+        if voice:
+            cmd.extend(["-v", voice])
+        if rate is not None:
+            cmd.extend(["-r", str(rate)])
+        cmd.append(text)
 
     elif system == "Linux":
-        cmd = ["spd-say", text]
+        cmd = ["spd-say"]
+        if voice:
+            cmd.extend(["-o", voice])
+        cmd.append(text)
         if blocking:
             cmd.append("--wait")
 
     elif system == "Windows":
+        voice_script = ""
+        if voice:
+            voice_script = f"$synth.SelectVoice('{voice}'); "
         cmd = [
             "PowerShell",
             "-Command",
             "Add-Type -AssemblyName System.Speech; "
-            f"(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{text}')",
+            "$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            f"{voice_script}"
+            f"$synth.Speak('{text}');",
         ]
 
     else:
@@ -223,11 +241,17 @@ def say(text: str, blocking: bool = False):
         subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW if system == "Windows" else 0)
 
 
-def log_say(text: str, play_sounds: bool = True, blocking: bool = False):
+def log_say(
+    text: str,
+    play_sounds: bool = True,
+    blocking: bool = False,
+    voice: str | None = None,
+    rate: int | None = None,
+):
     logging.info(text)
 
     if play_sounds:
-        say(text, blocking)
+        say(text, blocking, voice=voice, rate=rate)
 
 
 def get_channel_first_image_shape(image_shape: tuple) -> tuple:

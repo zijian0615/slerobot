@@ -14,10 +14,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass, field
+from typing import Literal
 
 from slerobot.configs.policies import PreTrainedConfig
 from slerobot.configs.types import NormalizationMode
 #from slerobot.optim.optimizers import AdamWConfig
+
+
+def resolve_warning_camera_keys(config: "ACTConfig") -> list[str]:
+    """Return image feature keys that participate in the top-right ROI warning check."""
+    all_keys = list(config.image_features.keys())
+    if not all_keys:
+        raise ValueError("Attention visualization requires at least one image in `input_features`.")
+
+    if config.attention_camera is None:
+        return all_keys
+
+    camera = config.attention_camera
+    for key in all_keys:
+        if key == camera or key.split(".")[-1] == camera:
+            return [key]
+
+    available = [k.split(".")[-1] for k in all_keys]
+    raise ValueError(
+        f"`attention_camera`={camera!r} not found in policy image inputs. "
+        f"Available cameras: {available} (full keys: {all_keys})."
+    )
+
+
+# Backward-compatible alias.
+resolve_attention_image_keys = resolve_warning_camera_keys
 
 
 @PreTrainedConfig.register_subclass("act")
@@ -118,6 +144,26 @@ class ACTConfig(PreTrainedConfig):
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
     temporal_ensemble_coeff: float | None = None
+    enable_attention_visualization: bool = False
+    # Attention heatmap method: "eigen_cam" (gradient-free PCA) or "grad_cam_pp" (Grad-CAM++).
+    attention_cam_method: Literal["eigen_cam", "grad_cam_pp"] = "eigen_cam"
+    # Grad-CAM++ target: backprop from this action index in the predicted chunk (0 = current step).
+    grad_cam_target_action_index: int = 0
+    # Top-right ROI (pixels) checked for large high-activation (red in JET) areas in the heatmap.
+    grad_cam_edge_margin_px: int = 100
+    # Warn when this fraction of ROI pixels exceed `cam_warning_high_activation_threshold`.
+    grad_cam_edge_mean_threshold: float = 0.25
+    # Normalized heatmap value treated as high activation (maps to red in the JET colormap).
+    cam_warning_high_activation_threshold: float = 0.65
+    # Camera for top-right ROI warning only (CAM is always computed for all cameras).
+    # Short name (e.g. "front") or full feature key. None = warn on all cameras.
+    # After a warning on the previous step, the next model input whites that camera's top-right ROI.
+    attention_camera: str | None = None
+    # ROI warning speech (macOS: list voices with `say -v '?'`).
+    warning_speech_enabled: bool = True
+    warning_speech_voice: str | None = None
+    warning_speech_rate: int | None = None
+    warning_speech_min_duration_s: float = 5.0
 
     # Training and loss computation.
     dropout: float = 0.1
@@ -150,6 +196,14 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
+        if self.attention_cam_method not in ("eigen_cam", "grad_cam_pp"):
+            raise ValueError(
+                f"`attention_cam_method` must be 'eigen_cam' or 'grad_cam_pp'. Got {self.attention_cam_method!r}."
+            )
+        if self.attention_cam_method == "grad_cam_pp" and not self.image_features:
+            raise ValueError("`grad_cam_pp` requires at least one image input in `input_features`.")
+        if self.enable_attention_visualization and self.attention_camera is not None:
+            resolve_warning_camera_keys(self)
 
     # def get_optimizer_preset(self) -> AdamWConfig:
     #     return AdamWConfig(

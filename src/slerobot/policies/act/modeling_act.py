@@ -19,11 +19,13 @@ As per Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware (https
 The majority of changes here involve removing unused code, unifying naming, and adding helpful comments.
 """
 
+import logging
 import math
+import time
 from collections import deque
 from collections.abc import Callable
 from itertools import chain
-
+import cv2
 import einops
 import numpy as np
 import torch
@@ -33,9 +35,603 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
-from slerobot.policies.act.configuration_act import ACTConfig
+from slerobot.policies.act.configuration_act import ACTConfig, resolve_warning_camera_keys
 from slerobot.policies.pretrained import PreTrainedPolicy
 from slerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+
+ATTENTION_CAM_METHODS = frozenset({"eigen_cam", "grad_cam_pp"})
+
+
+def attention_cam_method_display_name(method: str) -> str:
+    return {"eigen_cam": "Eigen-CAM", "grad_cam_pp": "Grad-CAM++"}.get(method, method)
+
+
+def create_act_attention_helper(policy: "ACTPolicy"):
+    """Instantiate the configured attention/CAM helper for an ACT policy."""
+    method = policy.config.attention_cam_method
+    if method == "eigen_cam":
+        return ACTEigenCAMHelper(policy)
+    if method == "grad_cam_pp":
+        return ACTGradCAMPlusPlusHelper(policy)
+    raise ValueError(
+        f"Unknown attention_cam_method={method!r}. Choose from {sorted(ATTENTION_CAM_METHODS)}."
+    )
+
+
+class ACTEigenCAMHelper:
+    """Eigen-CAM on ResNet backbone feature maps, one heatmap per camera (gradient-free attention visualization)."""
+
+    CAM_METHOD_LABEL = "EIGEN-CAM"
+    EDGE_WARNING_BANNER_LABEL = "WARNING! Automatic Mitigation"
+    EDGE_WARNING_SPEECH_TEXT = "Warning, automatic mitigation adopted"
+
+    def __init__(self, policy: "ACTPolicy"):
+        self.policy = policy
+        self.config = policy.config
+        self.last_observation: dict[str, Tensor] | None = None
+        self.last_attention_maps: dict[str, np.ndarray] | None = None
+        self.last_edge_warnings: dict[str, bool] = {}
+        self.last_edge_warning_stats: dict[str, float] = {}
+        self.warning_image_keys = resolve_warning_camera_keys(self.config)
+        self._warning_active_since: float | None = None
+        self._warning_speech_announced: bool = False
+
+        if not hasattr(self.policy.model, "backbone"):
+            raise AttributeError(
+                "Eigen-CAM requires a vision backbone. Enable image inputs in ACTConfig."
+            )
+
+        target_action_index = self.config.grad_cam_target_action_index
+        if not (0 <= target_action_index < self.config.chunk_size):
+            raise ValueError(
+                f"grad_cam_target_action_index ({target_action_index}) must be in "
+                f"[0, {self.config.chunk_size - 1}]."
+            )
+
+    def _activation_for_image_key(
+        self, image_key: str, backbone_activations: list[Tensor]
+    ) -> Tensor | None:
+        all_keys = list(self.config.image_features.keys())
+        if image_key not in all_keys:
+            return None
+        activation_index = all_keys.index(image_key)
+        if activation_index >= len(backbone_activations):
+            return None
+        return backbone_activations[activation_index]
+
+    def predict_action_chunk_with_attention(self, batch: dict[str, Tensor]) -> Tensor:
+        """Run inference and compute per-camera Eigen-CAM maps (stored in last_attention_maps)."""
+        self.last_observation = dict(batch)
+        backbone_activations: list[Tensor] = []
+
+        def backbone_hook(_module, _inputs, output) -> None:
+            feature_map = output["feature_map"]
+            backbone_activations.append(feature_map)
+
+        handle = self.policy.model.backbone.register_forward_hook(backbone_hook)
+
+        try:
+            with torch.no_grad():
+                actions = self.policy.model(batch)[0]
+        finally:
+            handle.remove()
+
+        attention_maps: dict[str, np.ndarray] = {}
+        self.last_edge_warnings = {}
+        self.last_edge_warning_stats = {}
+
+        for image_key in self.config.image_features:
+            activation = self._activation_for_image_key(image_key, backbone_activations)
+            if activation is None:
+                continue
+
+            cam_map = self._compute_eigen_cam(activation)
+            if cam_map is None:
+                continue
+
+            attention_maps[image_key] = cam_map
+            if image_key not in self.warning_image_keys:
+                self.last_edge_warnings[image_key] = False
+                continue
+
+            image_hw = self._image_hw_from_batch(batch, image_key)
+            if image_hw is None:
+                continue
+
+            self._record_cam_warning(image_key, cam_map, image_hw)
+
+        self.last_attention_maps = attention_maps or None
+        if self.last_attention_maps is None:
+            logging.warning("%s did not produce any heatmaps.", self.CAM_METHOD_LABEL)
+
+        return actions.detach()
+
+    def _record_cam_warning(self, image_key: str, heatmap: np.ndarray, image_hw: tuple[int, int]) -> None:
+        warning, red_fraction = self.check_top_right_red_activation(
+            heatmap,
+            image_hw=image_hw,
+            roi_size_px=self.config.grad_cam_edge_margin_px,
+            red_fraction_threshold=self.config.grad_cam_edge_mean_threshold,
+            high_activation_threshold=self.config.cam_warning_high_activation_threshold,
+        )
+        self.last_edge_warnings[image_key] = warning
+        self.last_edge_warning_stats[image_key] = red_fraction
+        if warning:
+            logging.warning(
+                "%s top-right ROI red-area high for '%s': red_frac=%.3f (threshold=%.3f, "
+                "activation_thr=%.2f, roi=%dpx)",
+                self.CAM_METHOD_LABEL,
+                image_key,
+                red_fraction,
+                self.config.grad_cam_edge_mean_threshold,
+                self.config.cam_warning_high_activation_threshold,
+                self.config.grad_cam_edge_margin_px,
+            )
+
+    @property
+    def image_keys_needing_roi_mask(self) -> set[str]:
+        """Image keys that triggered a warning on the previous inference step."""
+        return {key for key, active in self.last_edge_warnings.items() if active}
+
+    def clear_warning_masks(self) -> None:
+        self.last_edge_warnings.clear()
+        self.last_edge_warning_stats.clear()
+        self._warning_active_since = None
+        self._warning_speech_announced = False
+
+    def _any_warning_active(self) -> bool:
+        return any(self.last_edge_warnings.get(key, False) for key in self.warning_image_keys)
+
+    def announce_new_edge_warnings(
+        self,
+        play_sounds: bool = True,
+        voice: str | None = None,
+        rate: int | None = None,
+    ) -> None:
+        """Speak once after ROI warning stays active for `warning_speech_min_duration_s`."""
+        any_active = self._any_warning_active()
+        now = time.perf_counter()
+        min_duration_s = self.config.warning_speech_min_duration_s
+
+        if not any_active:
+            self._warning_active_since = None
+            self._warning_speech_announced = False
+            return
+
+        if self._warning_active_since is None:
+            self._warning_active_since = now
+
+        if self._warning_speech_announced:
+            return
+
+        if now - self._warning_active_since < min_duration_s:
+            return
+
+        self._warning_speech_announced = True
+        if not play_sounds or not self.config.warning_speech_enabled:
+            return
+
+        from slerobot.utils.utils import log_say
+
+        speech_voice = voice if voice is not None else self.config.warning_speech_voice
+        speech_rate = rate if rate is not None else self.config.warning_speech_rate
+        log_say(
+            self.EDGE_WARNING_SPEECH_TEXT,
+            play_sounds=True,
+            blocking=False,
+            voice=speech_voice,
+            rate=speech_rate,
+        )
+
+    @staticmethod
+    def camera_short_name(image_key: str) -> str:
+        return image_key.split(".")[-1]
+
+    @staticmethod
+    def apply_warning_roi_mask_to_observation(
+        observation: dict[str, np.ndarray],
+        image_keys: set[str],
+        roi_size_px: int,
+    ) -> None:
+        """Set the top-right ROI to white on cameras with an active warning (in-place)."""
+        if not image_keys:
+            return
+
+        masked_short_names = {ACTEigenCAMHelper.camera_short_name(k) for k in image_keys}
+        for obs_key, image in observation.items():
+            if "image" not in obs_key:
+                continue
+            short_name = ACTEigenCAMHelper.camera_short_name(obs_key)
+            if obs_key not in image_keys and short_name not in masked_short_names:
+                continue
+            if image.ndim != 3:
+                continue
+
+            image_h, image_w = int(image.shape[0]), int(image.shape[1])
+            roi_h = min(roi_size_px, image_h)
+            roi_w = min(roi_size_px, image_w)
+            if roi_h <= 0 or roi_w <= 0:
+                continue
+
+            white_value: float | int = 255 if image.dtype == np.uint8 else 1.0
+            observation[obs_key][:roi_h, image_w - roi_w : image_w] = white_value
+
+    def _image_hw_from_batch(self, batch: dict[str, Tensor], image_key: str) -> tuple[int, int] | None:
+        if image_key not in batch:
+            return None
+        img = batch[image_key]
+        if img.dim() == 4:
+            img = img[0]
+        if img.dim() != 3:
+            return None
+        return int(img.shape[1]), int(img.shape[2])
+
+    @staticmethod
+    def check_top_right_red_activation(
+        heatmap: np.ndarray,
+        image_hw: tuple[int, int],
+        roi_size_px: int,
+        red_fraction_threshold: float,
+        high_activation_threshold: float,
+    ) -> tuple[bool, float]:
+        """Return (warning_triggered, red_pixel_fraction) in the top-right ROI on full-resolution image."""
+        image_h, image_w = image_hw
+        roi_h = min(roi_size_px, image_h)
+        roi_w = min(roi_size_px, image_w)
+        if roi_h <= 0 or roi_w <= 0:
+            return False, 0.0
+
+        heatmap_resized = cv2.resize(heatmap, (image_w, image_h), interpolation=cv2.INTER_LINEAR)
+        roi = heatmap_resized[:roi_h, image_w - roi_w :]
+        red_fraction = float((roi >= high_activation_threshold).mean())
+        return red_fraction >= red_fraction_threshold, red_fraction
+
+    @staticmethod
+    def check_edge_activation(
+        heatmap: np.ndarray,
+        image_hw: tuple[int, int],
+        margin_px: int,
+        mean_threshold: float,
+    ) -> tuple[bool, float]:
+        """Backward-compatible alias for top-right ROI red-area check."""
+        return ACTEigenCAMHelper.check_top_right_red_activation(
+            heatmap,
+            image_hw=image_hw,
+            roi_size_px=margin_px,
+            red_fraction_threshold=mean_threshold,
+            high_activation_threshold=0.65,
+        )
+
+    @staticmethod
+    def _build_top_right_roi_mask(image_hw: tuple[int, int], roi_size_px: int) -> np.ndarray:
+        image_h, image_w = image_hw
+        roi_h = min(roi_size_px, image_h)
+        roi_w = min(roi_size_px, image_w)
+        roi_mask = np.zeros((image_h, image_w), dtype=bool)
+        if roi_h <= 0 or roi_w <= 0:
+            return roi_mask
+        roi_mask[:roi_h, image_w - roi_w :] = True
+        return roi_mask
+
+    @staticmethod
+    def _build_edge_region_mask(image_hw: tuple[int, int], margin_px: int) -> np.ndarray:
+        """Backward-compatible alias for the top-right ROI mask."""
+        return ACTEigenCAMHelper._build_top_right_roi_mask(image_hw, margin_px)
+
+    @staticmethod
+    def _compute_eigen_cam(activation: Tensor) -> np.ndarray | None:
+        """Compute Eigen-CAM from feature map using principal component analysis."""
+        # activation shape: (batch_size, channels, height, width)
+        b, c, h, w = activation.shape
+        
+        if c < 1 or h < 1 or w < 1:
+            return None
+        
+        # Reshape to (batch_size, channels, h*w)
+        x = activation.reshape(b, c, -1).detach().cpu()
+        
+        # For batch processing, take first sample
+        x = x[0]  # (channels, h*w)
+        
+        # Compute mean for centering
+        x_mean = x.mean(dim=1, keepdim=True)
+        x_centered = x - x_mean
+        
+        # Compute covariance matrix (channels x channels)
+        cov = torch.mm(x_centered, x_centered.t()) / max(1, x_centered.shape[1] - 1)
+        
+        # Compute eigenvalues and eigenvectors
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(cov)
+            # Use eigenvector corresponding to largest eigenvalue
+            principal_component = eigenvectors[:, -1]
+        except Exception:
+            return None
+        
+        # Project feature map onto principal component
+        cam = torch.mm(principal_component.unsqueeze(0), x)  # (1, h*w)
+        cam = cam.reshape(h, w).numpy()
+        
+        return ACTEigenCAMHelper._normalize_heatmap(cam)
+
+    @staticmethod
+    def _normalize_heatmap(heatmap: np.ndarray) -> np.ndarray:
+        heatmap = np.maximum(heatmap, 0)
+        heatmap_min = heatmap.min()
+        heatmap_max = heatmap.max()
+        if heatmap_max > heatmap_min:
+            return ((heatmap - heatmap_min) / (heatmap_max - heatmap_min)).astype(np.float32)
+        return np.zeros_like(heatmap, dtype=np.float32)
+
+    def _extract_images(self, observation: dict[str, Tensor]) -> list[Tensor]:
+        images = []
+        for key in self.config.image_features:
+            if key in observation:
+                images.append(observation[key])
+        return images
+
+    @classmethod
+    def overlay_attention_on_image(
+        cls,
+        image: np.ndarray,
+        attention_map: np.ndarray,
+        overlay_alpha: float = 0.5,
+        use_rgb: bool = True,
+        edge_warning: bool = False,
+        edge_margin_px: int = 50,
+        edge_warning_banner_px: int = 48,
+        edge_mask_alpha: float = 0.55,
+        edge_warning_mean: float | None = None,
+        edge_warning_threshold: float | None = None,
+    ) -> np.ndarray:
+        img_np = image
+        if img_np.ndim == 3 and img_np.shape[0] in (3, 4):
+            img_np = np.transpose(img_np, (1, 2, 0))
+        if img_np.dtype != np.float32 and img_np.dtype != np.float64:
+            img_np = img_np.astype(np.float32)
+        if img_np.max() > 1.0:
+            img_np = img_np / 255.0
+
+        h, w = img_np.shape[:2]
+        attn_map_resized = cv2.resize(attention_map, (w, h))
+        heatmap = cv2.applyColorMap(np.uint8(255 * attn_map_resized), cv2.COLORMAP_JET)
+        if use_rgb:
+            heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+
+        vis = cv2.addWeighted(
+            np.uint8(255 * img_np),
+            1 - overlay_alpha,
+            heatmap,
+            overlay_alpha,
+            0,
+        )
+
+        if edge_warning:
+            vis = cls._apply_edge_warning_overlay(
+                vis,
+                image_hw=(h, w),
+                margin_px=edge_margin_px,
+                banner_px=edge_warning_banner_px,
+                mask_alpha=edge_mask_alpha,
+                edge_mean=edge_warning_mean,
+                edge_threshold=edge_warning_threshold,
+            )
+
+        return vis
+
+    @classmethod
+    def _format_edge_warning_label(
+        cls,
+        red_fraction: float | None,
+        fraction_threshold: float | None,
+        roi_size_px: int,
+    ) -> str:
+        if red_fraction is not None and fraction_threshold is not None:
+            return (
+                f"{cls.EDGE_WARNING_BANNER_LABEL}  red_frac={red_fraction:.3f}  "
+                f"thr={fraction_threshold:.3f}  roi={roi_size_px}px"
+            )
+        return cls.EDGE_WARNING_BANNER_LABEL
+
+    @classmethod
+    def _apply_edge_warning_overlay(
+        cls,
+        vis: np.ndarray,
+        image_hw: tuple[int, int],
+        margin_px: int,
+        banner_px: int,
+        mask_alpha: float,
+        edge_mean: float | None = None,
+        edge_threshold: float | None = None,
+    ) -> np.ndarray:
+        image_h, image_w = image_hw
+        output = vis.copy()
+
+        label = cls._format_edge_warning_label(edge_mean, edge_threshold, margin_px)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.55
+        thickness = 2
+        (_text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+        banner_px = max(min(banner_px, image_h), text_h + baseline + 12)
+
+        banner = output.copy()
+        cv2.rectangle(banner, (0, 0), (image_w, banner_px), (180, 0, 0), thickness=-1)
+        output = cv2.addWeighted(output, 0.35, banner, 0.65, 0)
+        cv2.putText(
+            output,
+            label,
+            (12, text_h + 8),
+            font,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+        return output
+
+    def visualize_attention(
+        self,
+        images: list[Tensor] | None = None,
+        attention_maps: list[np.ndarray | None] | dict[str, np.ndarray] | None = None,
+        observation: dict[str, Tensor] | None = None,
+        use_rgb: bool = True,
+        overlay_alpha: float = 0.5,
+    ) -> list[np.ndarray | None]:
+        if images is None:
+            if observation is not None:
+                images = self._extract_images(observation)
+            elif self.last_observation is not None:
+                images = self._extract_images(self.last_observation)
+            else:
+                raise ValueError("No images provided and no stored observation available")
+
+        if attention_maps is None:
+            if self.last_attention_maps is not None:
+                attention_maps = [
+                    self.last_attention_maps.get(key) for key in self.config.image_features
+                ]
+            else:
+                raise ValueError("No attention maps provided and no stored attention maps available")
+        elif isinstance(attention_maps, dict):
+            attention_maps = [attention_maps.get(key) for key in self.config.image_features]
+
+        image_keys = list(self.config.image_features.keys())
+        visualizations: list[np.ndarray | None] = []
+        for image_key, img, attn_map in zip(image_keys, images, attention_maps):
+            if img is None or attn_map is None:
+                visualizations.append(None)
+                continue
+
+            if isinstance(img, Tensor):
+                if img.dim() == 4:
+                    img = img.squeeze(0)
+                img_np = img.permute(1, 2, 0).detach().cpu().numpy()
+            else:
+                img_np = img
+
+            edge_warning = self.last_edge_warnings.get(image_key, False)
+            visualizations.append(
+                self.overlay_attention_on_image(
+                    img_np,
+                    attn_map,
+                    overlay_alpha=overlay_alpha,
+                    use_rgb=use_rgb,
+                    edge_warning=edge_warning,
+                    edge_margin_px=self.config.grad_cam_edge_margin_px,
+                    edge_warning_mean=self.last_edge_warning_stats.get(image_key),
+                    edge_warning_threshold=self.config.grad_cam_edge_mean_threshold,
+                )
+            )
+
+        return visualizations
+
+
+class ACTGradientCAMHelperBase(ACTEigenCAMHelper):
+    """Shared forward/backward hook path for gradient-based CAM methods."""
+
+    def __init__(self, policy: "ACTPolicy"):
+        super().__init__(policy)
+
+    def predict_action_chunk_with_attention(self, batch: dict[str, Tensor]) -> Tensor:
+        self.last_observation = dict(batch)
+        backbone_activations: list[Tensor] = []
+
+        def backbone_hook(_module, _inputs, output) -> None:
+            feature_map = output["feature_map"]
+            feature_map.retain_grad()
+            backbone_activations.append(feature_map)
+
+        handle = self.policy.model.backbone.register_forward_hook(backbone_hook)
+        self.policy.model.zero_grad(set_to_none=True)
+
+        try:
+            with torch.enable_grad():
+                actions = self.policy.model(batch)[0]
+                action_index = min(self.config.grad_cam_target_action_index, actions.shape[1] - 1)
+                target = actions[:, action_index, :].sum()
+                target.backward(retain_graph=False)
+        finally:
+            handle.remove()
+
+        attention_maps: dict[str, np.ndarray] = {}
+        self.last_edge_warnings = {}
+        self.last_edge_warning_stats = {}
+
+        for image_key in self.config.image_features:
+            activation = self._activation_for_image_key(image_key, backbone_activations)
+            if activation is None:
+                continue
+
+            cam_map = self._compute_cam(activation)
+            if cam_map is None:
+                continue
+
+            attention_maps[image_key] = cam_map
+            if image_key not in self.warning_image_keys:
+                self.last_edge_warnings[image_key] = False
+                continue
+
+            image_hw = self._image_hw_from_batch(batch, image_key)
+            if image_hw is None:
+                continue
+
+            self._record_cam_warning(image_key, cam_map, image_hw)
+
+        self.last_attention_maps = attention_maps or None
+        if self.last_attention_maps is None:
+            logging.warning("%s did not produce any heatmaps.", self.CAM_METHOD_LABEL)
+
+        return actions.detach()
+
+    @staticmethod
+    def _compute_cam(activation: Tensor) -> np.ndarray | None:
+        raise NotImplementedError
+
+
+class ACTGradCAMHelper(ACTGradientCAMHelperBase):
+    """Grad-CAM on ResNet backbone feature maps, one heatmap per camera."""
+
+    CAM_METHOD_LABEL = "GRAD-CAM"
+
+    @staticmethod
+    def _compute_cam(activation: Tensor) -> np.ndarray | None:
+        gradients = activation.grad
+        if gradients is None:
+            return None
+
+        weights = gradients.mean(dim=(2, 3), keepdim=True)
+        cam = F.relu((weights * activation).sum(dim=1))
+        cam_np = cam[0].detach().float().cpu().numpy()
+        return ACTEigenCAMHelper._normalize_heatmap(cam_np)
+
+
+class ACTGradCAMPlusPlusHelper(ACTGradientCAMHelperBase):
+    """Grad-CAM++ on ResNet backbone feature maps, one heatmap per camera."""
+
+    CAM_METHOD_LABEL = "GRAD-CAM++"
+
+    @staticmethod
+    def _compute_cam(activation: Tensor) -> np.ndarray | None:
+        gradients = activation.grad
+        if gradients is None:
+            return None
+
+        grads_power_2 = gradients.pow(2)
+        grads_power_3 = gradients.pow(3)
+        sum_activations = activation.sum(dim=(2, 3), keepdim=True)
+        eps = 1e-8
+        alpha_denom = 2.0 * grads_power_2 + sum_activations * grads_power_3 + eps
+        alpha = grads_power_2 / alpha_denom
+
+        weights = (alpha * F.relu(gradients)).sum(dim=(2, 3), keepdim=True)
+        cam = F.relu((weights * activation).sum(dim=1))
+        cam_np = cam[0].detach().float().cpu().numpy()
+        return ACTEigenCAMHelper._normalize_heatmap(cam_np)
+
+
+# Backward-compatible alias (default CAM is Eigen-CAM; use create_act_attention_helper in policy code).
+ACTAttentionHelper = ACTEigenCAMHelper
 
 
 class ACTPolicy(PreTrainedPolicy):
@@ -66,6 +662,30 @@ class ACTPolicy(PreTrainedPolicy):
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
+        self._attention_helper: ACTEigenCAMHelper | ACTGradCAMPlusPlusHelper | None = None
+        if config.enable_attention_visualization and config.image_features:
+            self._attention_helper = create_act_attention_helper(self)
+            cam_name = attention_cam_method_display_name(config.attention_cam_method)
+            all_cameras = [k.split(".")[-1] for k in config.image_features]
+            warning_cameras = [k.split(".")[-1] for k in resolve_warning_camera_keys(config)]
+            if config.n_action_steps > 1:
+                logging.info(
+                    "%s will refresh every control step (n_action_steps=%d); "
+                    "CAM on %s, ROI warning on %s; "
+                    "robot actions are still consumed from the chunk queue.",
+                    cam_name,
+                    config.n_action_steps,
+                    all_cameras,
+                    warning_cameras,
+                )
+            else:
+                logging.info(
+                    "ACT attention visualization: %s on %s, ROI warning on %s.",
+                    cam_name,
+                    all_cameras,
+                    warning_cameras,
+                )
+
         self.reset()
 
     def get_optim_params(self) -> dict:
@@ -91,6 +711,8 @@ class ACTPolicy(PreTrainedPolicy):
 
     def reset(self):
         """This should be called whenever the environment is reset."""
+        if self._attention_helper is not None:
+            self._attention_helper.clear_warning_masks()
         if self.config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler.reset()
         else:
@@ -103,25 +725,40 @@ class ACTPolicy(PreTrainedPolicy):
         This method wraps `select_actions` in order to return one action at a time for execution in the
         environment. It works by managing the actions in a queue and only calling `select_actions` when the
         queue is empty.
+
+        When gradient-based CAM (Grad-CAM++) is enabled, the model runs forward+backward on every control
+        step so heatmaps track the latest camera frames. Eigen-CAM is gradient-free but still refreshes each
+        step. Executed actions continue to be consumed from the action queue when `n_action_steps > 1`.
         """
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
 
+        if self.config.image_features:
+            batch = dict(batch)
+            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+
+        # Gradient-based CAM needs autograd and must not be tied to the action-queue refresh rate.
+        actions_chunk: Tensor | None = None
+        if self._attention_helper is not None:
+            actions_chunk = self._attention_helper.predict_action_chunk_with_attention(batch)
+
         if self.config.temporal_ensemble_coeff is not None:
-            actions = self.predict_action_chunk(batch)
+            actions = actions_chunk if actions_chunk is not None else self.predict_action_chunk(batch)
             action = self.temporal_ensembler.update(actions)
             return action
 
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
         # querying the policy.
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            if actions_chunk is None:
+                actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            else:
+                actions = actions_chunk[:, : self.config.n_action_steps]
 
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
 
-    @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
@@ -130,8 +767,70 @@ class ACTPolicy(PreTrainedPolicy):
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        actions = self.model(batch)[0]
+        if self._attention_helper is not None:
+            return self._attention_helper.predict_action_chunk_with_attention(batch)
+
+        with torch.no_grad():
+            actions = self.model(batch)[0]
         return actions
+
+    @property
+    def last_attention_maps(self) -> dict[str, np.ndarray] | None:
+        if self._attention_helper is None:
+            return None
+        return self._attention_helper.last_attention_maps
+
+    @property
+    def last_grad_cam_edge_warnings(self) -> dict[str, bool]:
+        if self._attention_helper is None:
+            return {}
+        return self._attention_helper.last_edge_warnings
+
+    @property
+    def last_grad_cam_edge_stats(self) -> dict[str, float]:
+        if self._attention_helper is None:
+            return {}
+        return self._attention_helper.last_edge_warning_stats
+
+    def announce_attention_warnings(
+        self,
+        play_sounds: bool = True,
+        voice: str | None = None,
+        rate: int | None = None,
+    ) -> None:
+        if self._attention_helper is not None:
+            self._attention_helper.announce_new_edge_warnings(
+                play_sounds=play_sounds,
+                voice=voice,
+                rate=rate,
+            )
+
+    @property
+    def attention_overlay_helper(self) -> type[ACTEigenCAMHelper]:
+        """Helper class used for overlaying heatmaps (matches the configured CAM method)."""
+        if self._attention_helper is None:
+            return ACTEigenCAMHelper
+        return type(self._attention_helper)
+
+    def visualize_attention(
+        self,
+        images: list[Tensor] | None = None,
+        attention_maps: list[np.ndarray | None] | dict[str, np.ndarray] | None = None,
+        observation: dict[str, Tensor] | None = None,
+        use_rgb: bool = True,
+        overlay_alpha: float = 0.5,
+    ) -> list[np.ndarray | None]:
+        if self._attention_helper is None:
+            raise RuntimeError(
+                "Attention visualization is disabled. Set `enable_attention_visualization=True` in ACTConfig."
+            )
+        return self._attention_helper.visualize_attention(
+            images=images,
+            attention_maps=attention_maps,
+            observation=observation,
+            use_rgb=use_rgb,
+            overlay_alpha=overlay_alpha,
+        )
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""

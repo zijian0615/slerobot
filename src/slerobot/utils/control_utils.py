@@ -1,16 +1,29 @@
 import logging
 import traceback
 from contextlib import nullcontext
-from copy import copy
 from functools import cache
 from typing import Any
 
 import numpy as np
 import torch
 from deepdiff import DeepDiff
+from slerobot.policies.act.modeling_act import ACTEigenCAMHelper
 from slerobot.policies.pretrained import PreTrainedPolicy
 from slerobot.processor import PolicyAction, PolicyProcessorPipeline
 from slerobot.policies.utils import prepare_observation_for_inference
+
+
+def _clone_numpy_observation(observation: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy array entries so `prepare_observation_for_inference` can mutate safely."""
+    cloned: dict[str, Any] = {}
+    for key, value in observation.items():
+        if isinstance(value, np.ndarray):
+            cloned[key] = value.copy()
+        elif isinstance(value, torch.Tensor):
+            cloned[key] = value.detach().cpu().numpy()
+        else:
+            cloned[key] = value
+    return cloned
 
 
 def _summarize_tensor(tensor: torch.Tensor, max_items: int = 16) -> str:
@@ -133,21 +146,37 @@ def predict_action(
     Returns:
         A `torch.Tensor` containing the predicted action, ready for the robot.
     """
-    observation = copy(observation)
+    observation_numpy = _clone_numpy_observation(observation)
+    attention_helper = getattr(policy, "_attention_helper", None)
+    if attention_helper is not None and attention_helper.image_keys_needing_roi_mask:
+        ACTEigenCAMHelper.apply_warning_roi_mask_to_observation(
+            observation_numpy,
+            attention_helper.image_keys_needing_roi_mask,
+            policy.config.grad_cam_edge_margin_px,
+        )
+
     debug_counter = getattr(predict_action, "_debug_counter", 0)
+    # Grad-CAM++ needs autograd; inference_mode disables it entirely.
+    needs_grad = (
+        attention_helper is not None
+        and getattr(getattr(policy, "config", None), "attention_cam_method", "eigen_cam") == "grad_cam_pp"
+    )
     with (
-        torch.inference_mode(),
-        torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
+        nullcontext() if needs_grad else torch.inference_mode(),
+        torch.autocast(device_type=device.type)
+        if device.type == "cuda" and use_amp and not needs_grad
+        else nullcontext(),
     ):
         # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension
-        observation = prepare_observation_for_inference(observation, device, task, robot_type)
+        observation = prepare_observation_for_inference(
+            _clone_numpy_observation(observation_numpy), device, task, robot_type
+        )
         observation = preprocessor(observation)
 
         # Compute the next action with the policy
         # based on the current observation
         action = policy.select_action(observation)
         raw_action = action
-
         action = postprocessor(action)
 
     if debug_counter < 10:
