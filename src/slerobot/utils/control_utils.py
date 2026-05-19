@@ -160,6 +160,7 @@ def predict_action(
     needs_grad = (
         attention_helper is not None
         and getattr(getattr(policy, "config", None), "attention_cam_method", "eigen_cam") == "grad_cam_pp"
+        and attention_helper.should_refresh_attention()
     )
     with (
         nullcontext() if needs_grad else torch.inference_mode(),

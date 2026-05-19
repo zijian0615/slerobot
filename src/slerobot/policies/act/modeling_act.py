@@ -75,6 +75,7 @@ class ACTEigenCAMHelper:
         self.warning_image_keys = resolve_warning_camera_keys(self.config)
         self._warning_active_since: float | None = None
         self._warning_speech_announced: bool = False
+        self._last_cam_compute_time: float | None = None
 
         if not hasattr(self.policy.model, "backbone"):
             raise AttributeError(
@@ -144,7 +145,38 @@ class ACTEigenCAMHelper:
         if self.last_attention_maps is None:
             logging.warning("%s did not produce any heatmaps.", self.CAM_METHOD_LABEL)
 
+        self._last_cam_compute_time = time.perf_counter()
         return actions.detach()
+
+    def should_refresh_attention(self) -> bool:
+        interval_s = self.config.attention_cam_interval_s
+        if interval_s <= 0:
+            return True
+        if self._last_cam_compute_time is None:
+            return True
+        return (time.perf_counter() - self._last_cam_compute_time) >= interval_s
+
+    def update_last_observation(self, batch: dict[str, Tensor]) -> None:
+        self.last_observation = dict(batch)
+
+    def _prepare_batch_for_grad_cam(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Enable gradients on image inputs so Grad-CAM works with a frozen backbone."""
+        batch = dict(batch)
+        for key in self.config.image_features:
+            if key not in batch:
+                continue
+            image = batch[key]
+            if not image.requires_grad:
+                batch[key] = image.detach().requires_grad_(True)
+        if self.config.image_features:
+            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+        return batch
+
+    def predict_action_chunk_without_attention(self, batch: dict[str, Tensor]) -> Tensor:
+        """Forward-only action chunk; reuse cached heatmaps between CAM refreshes."""
+        self.update_last_observation(batch)
+        with torch.no_grad():
+            return self.policy.model(batch)[0]
 
     def _record_cam_warning(self, image_key: str, heatmap: np.ndarray, image_hw: tuple[int, int]) -> None:
         warning, red_fraction = self.check_top_right_red_activation(
@@ -178,6 +210,7 @@ class ACTEigenCAMHelper:
         self.last_edge_warning_stats.clear()
         self._warning_active_since = None
         self._warning_speech_announced = False
+        self._last_cam_compute_time = None
 
     def _any_warning_active(self) -> bool:
         return any(self.last_edge_warnings.get(key, False) for key in self.warning_image_keys)
@@ -533,37 +566,56 @@ class ACTGradientCAMHelperBase(ACTEigenCAMHelper):
     def __init__(self, policy: "ACTPolicy"):
         super().__init__(policy)
 
-    def predict_action_chunk_with_attention(self, batch: dict[str, Tensor]) -> Tensor:
-        self.last_observation = dict(batch)
-        backbone_activations: list[Tensor] = []
+    def _compute_grad_cam_for_image(self, image: Tensor) -> np.ndarray | None:
+        """Run Grad-CAM on the vision backbone only (matches ACT inference; actions use a separate forward)."""
+        if not image.requires_grad:
+            image = image.detach().requires_grad_(True)
+
+        activation_holder: list[Tensor] = []
 
         def backbone_hook(_module, _inputs, output) -> None:
             feature_map = output["feature_map"]
+            if not feature_map.requires_grad:
+                logging.warning(
+                    "%s: backbone feature_map has requires_grad=False; skipping retain_grad.",
+                    self.CAM_METHOD_LABEL,
+                )
+                return
             feature_map.retain_grad()
-            backbone_activations.append(feature_map)
+            activation_holder.append(feature_map)
 
         handle = self.policy.model.backbone.register_forward_hook(backbone_hook)
         self.policy.model.zero_grad(set_to_none=True)
 
         try:
             with torch.enable_grad():
-                actions = self.policy.model(batch)[0]
-                action_index = min(self.config.grad_cam_target_action_index, actions.shape[1] - 1)
-                target = actions[:, action_index, :].sum()
-                target.backward(retain_graph=False)
+                self.policy.model.backbone(image)
+                if not activation_holder:
+                    return None
+                activation_holder[0].sum().backward()
         finally:
             handle.remove()
+
+        if not activation_holder:
+            return None
+        return self._compute_cam(activation_holder[0])
+
+    def predict_action_chunk_with_attention(self, batch: dict[str, Tensor]) -> Tensor:
+        batch = self._prepare_batch_for_grad_cam(batch)
+        self.last_observation = dict(batch)
+
+        with torch.no_grad():
+            actions = self.policy.model(batch)[0]
 
         attention_maps: dict[str, np.ndarray] = {}
         self.last_edge_warnings = {}
         self.last_edge_warning_stats = {}
 
         for image_key in self.config.image_features:
-            activation = self._activation_for_image_key(image_key, backbone_activations)
-            if activation is None:
+            if image_key not in batch:
                 continue
 
-            cam_map = self._compute_cam(activation)
+            cam_map = self._compute_grad_cam_for_image(batch[image_key])
             if cam_map is None:
                 continue
 
@@ -582,6 +634,7 @@ class ACTGradientCAMHelperBase(ACTEigenCAMHelper):
         if self.last_attention_maps is None:
             logging.warning("%s did not produce any heatmaps.", self.CAM_METHOD_LABEL)
 
+        self._last_cam_compute_time = time.perf_counter()
         return actions.detach()
 
     @staticmethod
@@ -668,22 +721,29 @@ class ACTPolicy(PreTrainedPolicy):
             cam_name = attention_cam_method_display_name(config.attention_cam_method)
             all_cameras = [k.split(".")[-1] for k in config.image_features]
             warning_cameras = [k.split(".")[-1] for k in resolve_warning_camera_keys(config)]
+            cam_interval = config.attention_cam_interval_s
+            if cam_interval > 0:
+                cam_refresh = f"every {cam_interval:g}s (wall clock)"
+            else:
+                cam_refresh = "every control step"
             if config.n_action_steps > 1:
                 logging.info(
-                    "%s will refresh every control step (n_action_steps=%d); "
+                    "%s will refresh %s (n_action_steps=%d); "
                     "CAM on %s, ROI warning on %s; "
                     "robot actions are still consumed from the chunk queue.",
                     cam_name,
+                    cam_refresh,
                     config.n_action_steps,
                     all_cameras,
                     warning_cameras,
                 )
             else:
                 logging.info(
-                    "ACT attention visualization: %s on %s, ROI warning on %s.",
+                    "ACT attention visualization: %s on %s, ROI warning on %s; refresh %s.",
                     cam_name,
                     all_cameras,
                     warning_cameras,
+                    cam_refresh,
                 )
 
         self.reset()
@@ -718,7 +778,6 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
-    @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
 
@@ -726,9 +785,9 @@ class ACTPolicy(PreTrainedPolicy):
         environment. It works by managing the actions in a queue and only calling `select_actions` when the
         queue is empty.
 
-        When gradient-based CAM (Grad-CAM++) is enabled, the model runs forward+backward on every control
-        step so heatmaps track the latest camera frames. Eigen-CAM is gradient-free but still refreshes each
-        step. Executed actions continue to be consumed from the action queue when `n_action_steps > 1`.
+        CAM refresh is throttled by `attention_cam_interval_s` (wall clock). Between refreshes, actions use
+        forward-only inference and the last heatmap is reused. Executed actions continue to be consumed from
+        the action queue when `n_action_steps > 1`.
         """
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
 
@@ -736,28 +795,41 @@ class ACTPolicy(PreTrainedPolicy):
             batch = dict(batch)
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        # Gradient-based CAM needs autograd and must not be tied to the action-queue refresh rate.
         actions_chunk: Tensor | None = None
         if self._attention_helper is not None:
-            actions_chunk = self._attention_helper.predict_action_chunk_with_attention(batch)
+            if self._attention_helper.should_refresh_attention():
+                actions_chunk = self._attention_helper.predict_action_chunk_with_attention(batch)
+            else:
+                self._attention_helper.update_last_observation(batch)
 
         if self.config.temporal_ensemble_coeff is not None:
-            actions = actions_chunk if actions_chunk is not None else self.predict_action_chunk(batch)
+            if actions_chunk is not None:
+                actions = actions_chunk
+            elif self._attention_helper is not None:
+                actions = self._attention_helper.predict_action_chunk_without_attention(batch)
+            else:
+                actions = self.predict_action_chunk(batch)
             action = self.temporal_ensembler.update(actions)
             return action
 
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
         # querying the policy.
         if len(self._action_queue) == 0:
-            if actions_chunk is None:
-                actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
-            else:
+            if actions_chunk is not None:
                 actions = actions_chunk[:, : self.config.n_action_steps]
+            elif self._attention_helper is not None:
+                actions = self._attention_helper.predict_action_chunk_without_attention(batch)[
+                    :, : self.config.n_action_steps
+                ]
+            else:
+                with torch.no_grad():
+                    actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
 
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._action_queue.extend(actions.transpose(0, 1))
-        return self._action_queue.popleft()
+        with torch.no_grad():
+            return self._action_queue.popleft()
 
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict a chunk of actions given environment observations."""

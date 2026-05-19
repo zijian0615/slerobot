@@ -147,6 +147,8 @@ class ACTConfig(PreTrainedConfig):
     enable_attention_visualization: bool = False
     # Attention heatmap method: "eigen_cam" (gradient-free PCA) or "grad_cam_pp" (Grad-CAM++).
     attention_cam_method: Literal["eigen_cam", "grad_cam_pp"] = "eigen_cam"
+    # Min seconds between CAM refreshes (wall clock). <= 0 refreshes every control step.
+    attention_cam_interval_s: float = 1.0
     # Grad-CAM++ target: backprop from this action index in the predicted chunk (0 = current step).
     grad_cam_target_action_index: int = 0
     # Top-right ROI (pixels) checked for large high-activation (red in JET) areas in the heatmap.
