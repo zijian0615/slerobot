@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SLEROBOT // ATTACK · DEFENSE</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@500;700;900&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <canvas id="matrix" aria-hidden="true"></canvas>
+    <div class="scanlines" aria-hidden="true"></div>
+    <div class="shell">
+      <header class="topbar">
+        <div class="glitch-title" data-text="SLEROBOT OPS">SLEROBOT OPS</div>
+        <p class="subtitle">ATTACK / DEFENSE · LIVE CAMERAS · ACTION TRACES</p>
+        <div class="status-row">
+          <span id="status-pill" class="pill idle">STANDBY</span>
+          <span id="mode-label" class="mode-label">—</span>
+          <span id="pid-label" class="pid-label"></span>
+          <span id="step-label" class="step-label">step —</span>
+        </div>
+      </header>
+
+      <section class="controls">
+        <button id="btn-attack" class="mode-btn attack" type="button">
+          <span class="btn-glyph">⚡</span>
+          <span class="btn-title">ATTACK</span>
+          <span class="btn-desc">Grad-CAM++ · ROI warning · mitigation</span>
+        </button>
+        <button id="btn-defense" class="mode-btn defense" type="button">
+          <span class="btn-glyph">🛡</span>
+          <span class="btn-title">DEFENSE</span>
+          <span class="btn-desc">Policy only · no attention CAM</span>
+        </button>
+        <button id="btn-stop" class="mode-btn stop" type="button" disabled>
+          <span class="btn-glyph">■</span>
+          <span class="btn-title">ABORT</span>
+          <span class="btn-desc">Terminate recording process</span>
+        </button>
+      </section>
+
+      <main class="panels">
+        <section class="panel live-panel">
+          <div class="panel-head">
+            <h2>LIVE FEED</h2>
+            <span id="feed-meta" class="feed-meta">waiting…</span>
+          </div>
+          <div class="camera-grid">
+            <figure class="cam-card">
+              <figcaption>FRONT</figcaption>
+              <img id="cam-front" alt="front camera" />
+            </figure>
+            <figure class="cam-card">
+              <figcaption id="side-caption">SIDE</figcaption>
+              <img id="cam-side" alt="side camera" />
+            </figure>
+          </div>
+          <div class="charts-head">
+            <h3>ACTION TRAJECTORIES</h3>
+            <span class="charts-hint">j0 j1 j2 · j3 j4 j5 · j7</span>
+          </div>
+          <div class="charts-grid" id="charts-grid"></div>
+        </section>
+
+        <section class="panel log-panel">
+          <div class="panel-head">
+            <h2>TERMINAL</h2>
+            <span id="log-meta" class="log-meta">0 lines</span>
+          </div>
+          <pre id="terminal" class="terminal" aria-live="polite"></pre>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <span>UI :8765</span>
+        <span id="telemetry-label">Live telemetry</span>
+        <span>Edit <code>attack_defense_ui/config.json</code> to change robot / dataset</span>
+      </footer>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

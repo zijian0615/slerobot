@@ -1,0 +1,22 @@
+{
+  "robot_host": "172.30.109.22",
+  "robot_port": 16001,
+  "cameras_json": "{\"front\": {\"type\": \"opencv\", \"index_or_path\": 0, \"width\": 640, \"height\": 480, \"fps\": 20}, \"side\": {\"type\": \"opencv\", \"index_or_path\": 1, \"width\": 640, \"height\": 480, \"fps\": 20}}",
+  "single_task": "grasp cube",
+  "num_episodes": 5,
+  "episode_time_s": 720,
+  "reset_time_s": 20,
+  "policy_path": "zijian2022/xa4_125",
+  "repo_id_attack": "zijian2022/eval15_xa4_125_attack",
+  "repo_id_defense": "zijian2022/eval15_xa4_125_defense",
+  "attention_cam_method": "grad_cam_pp",
+  "grad_cam_target_action_index": 1,
+  "grad_cam_edge_margin_px": 130,
+  "grad_cam_edge_mean_threshold": 0.25,
+  "cam_warning_high_activation_threshold": 0.1,
+  "attention_camera": "side",
+  "tts_voice": "Samantha",
+  "telemetry_history_len": 400,
+  "camera_keys": ["front", "side"],
+  "action_plot_keys": ["j0", "j1", "j2", "j3", "j4", "j5", "j7"]
+}
