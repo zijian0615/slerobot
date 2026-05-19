@@ -161,6 +161,8 @@ class ACTConfig(PreTrainedConfig):
     # Short name (e.g. "front") or full feature key. None = warn on all cameras.
     # After a warning on the previous step, the next model input whites that camera's top-right ROI.
     attention_camera: str | None = None
+    # "detect": warning banner/speech only. "mitigation": warning + whiten top-right ROI for model input.
+    attention_roi_mode: Literal["detect", "mitigation"] = "mitigation"
     # ROI warning speech (macOS: list voices with `say -v '?'`).
     warning_speech_enabled: bool = True
     warning_speech_voice: str | None = None
@@ -206,6 +208,10 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError("`grad_cam_pp` requires at least one image input in `input_features`.")
         if self.enable_attention_visualization and self.attention_camera is not None:
             resolve_warning_camera_keys(self)
+        if self.attention_roi_mode not in ("detect", "mitigation"):
+            raise ValueError(
+                f"`attention_roi_mode` must be 'detect' or 'mitigation'. Got {self.attention_roi_mode!r}."
+            )
 
     # def get_optimizer_preset(self) -> AdamWConfig:
     #     return AdamWConfig(

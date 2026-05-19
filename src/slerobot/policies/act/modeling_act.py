@@ -40,6 +40,19 @@ from slerobot.policies.pretrained import PreTrainedPolicy
 from slerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 ATTENTION_CAM_METHODS = frozenset({"eigen_cam", "grad_cam_pp"})
+ATTENTION_ROI_MODES = frozenset({"detect", "mitigation"})
+
+
+def attention_roi_mode_banner_label(mode: str) -> str:
+    if mode == "detect":
+        return "WARNING! Anomaly Detected"
+    return "WARNING! Automatic Mitigation"
+
+
+def attention_roi_mode_speech_text(mode: str) -> str:
+    if mode == "detect":
+        return "Warning, anomaly detected in region of interest"
+    return "Warning, automatic mitigation adopted"
 
 
 def attention_cam_method_display_name(method: str) -> str:
@@ -62,8 +75,6 @@ class ACTEigenCAMHelper:
     """Eigen-CAM on ResNet backbone feature maps, one heatmap per camera (gradient-free attention visualization)."""
 
     CAM_METHOD_LABEL = "EIGEN-CAM"
-    EDGE_WARNING_BANNER_LABEL = "WARNING! Automatic Mitigation"
-    EDGE_WARNING_SPEECH_TEXT = "Warning, automatic mitigation adopted"
 
     def __init__(self, policy: "ACTPolicy"):
         self.policy = policy
@@ -202,8 +213,16 @@ class ACTEigenCAMHelper:
 
     @property
     def image_keys_needing_roi_mask(self) -> set[str]:
-        """Image keys that triggered a warning on the previous inference step."""
+        """Image keys to whiten when mitigation mode and warning was active on the previous step."""
+        if self.config.attention_roi_mode != "mitigation":
+            return set()
         return {key for key, active in self.last_edge_warnings.items() if active}
+
+    def edge_warning_banner_label(self) -> str:
+        return attention_roi_mode_banner_label(self.config.attention_roi_mode)
+
+    def edge_warning_speech_text(self) -> str:
+        return attention_roi_mode_speech_text(self.config.attention_roi_mode)
 
     def clear_warning_masks(self) -> None:
         self.last_edge_warnings.clear()
@@ -249,7 +268,7 @@ class ACTEigenCAMHelper:
         speech_voice = voice if voice is not None else self.config.warning_speech_voice
         speech_rate = rate if rate is not None else self.config.warning_speech_rate
         log_say(
-            self.EDGE_WARNING_SPEECH_TEXT,
+            self.edge_warning_speech_text(),
             play_sounds=True,
             blocking=False,
             voice=speech_voice,
@@ -416,6 +435,7 @@ class ACTEigenCAMHelper:
         edge_mask_alpha: float = 0.55,
         edge_warning_mean: float | None = None,
         edge_warning_threshold: float | None = None,
+        edge_warning_roi_mode: str = "mitigation",
     ) -> np.ndarray:
         img_np = image
         if img_np.ndim == 3 and img_np.shape[0] in (3, 4):
@@ -448,6 +468,7 @@ class ACTEigenCAMHelper:
                 mask_alpha=edge_mask_alpha,
                 edge_mean=edge_warning_mean,
                 edge_threshold=edge_warning_threshold,
+                edge_warning_roi_mode=edge_warning_roi_mode,
             )
 
         return vis
@@ -455,16 +476,18 @@ class ACTEigenCAMHelper:
     @classmethod
     def _format_edge_warning_label(
         cls,
+        roi_mode: str,
         red_fraction: float | None,
         fraction_threshold: float | None,
         roi_size_px: int,
     ) -> str:
+        banner = attention_roi_mode_banner_label(roi_mode)
         if red_fraction is not None and fraction_threshold is not None:
             return (
-                f"{cls.EDGE_WARNING_BANNER_LABEL}  red_frac={red_fraction:.3f}  "
+                f"{banner}  red_frac={red_fraction:.3f}  "
                 f"thr={fraction_threshold:.3f}  roi={roi_size_px}px"
             )
-        return cls.EDGE_WARNING_BANNER_LABEL
+        return banner
 
     @classmethod
     def _apply_edge_warning_overlay(
@@ -476,11 +499,14 @@ class ACTEigenCAMHelper:
         mask_alpha: float,
         edge_mean: float | None = None,
         edge_threshold: float | None = None,
+        edge_warning_roi_mode: str = "mitigation",
     ) -> np.ndarray:
         image_h, image_w = image_hw
         output = vis.copy()
 
-        label = cls._format_edge_warning_label(edge_mean, edge_threshold, margin_px)
+        label = cls._format_edge_warning_label(
+            edge_warning_roi_mode, edge_mean, edge_threshold, margin_px
+        )
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.55
         thickness = 2
@@ -554,6 +580,7 @@ class ACTEigenCAMHelper:
                     edge_margin_px=self.config.grad_cam_edge_margin_px,
                     edge_warning_mean=self.last_edge_warning_stats.get(image_key),
                     edge_warning_threshold=self.config.grad_cam_edge_mean_threshold,
+                    edge_warning_roi_mode=self.config.attention_roi_mode,
                 )
             )
 
@@ -721,6 +748,7 @@ class ACTPolicy(PreTrainedPolicy):
             cam_name = attention_cam_method_display_name(config.attention_cam_method)
             all_cameras = [k.split(".")[-1] for k in config.image_features]
             warning_cameras = [k.split(".")[-1] for k in resolve_warning_camera_keys(config)]
+            roi_mode = config.attention_roi_mode
             cam_interval = config.attention_cam_interval_s
             if cam_interval > 0:
                 cam_refresh = f"every {cam_interval:g}s (wall clock)"
@@ -729,19 +757,21 @@ class ACTPolicy(PreTrainedPolicy):
             if config.n_action_steps > 1:
                 logging.info(
                     "%s will refresh %s (n_action_steps=%d); "
-                    "CAM on %s, ROI warning on %s; "
+                    "CAM on %s, ROI %s on %s; "
                     "robot actions are still consumed from the chunk queue.",
                     cam_name,
                     cam_refresh,
                     config.n_action_steps,
                     all_cameras,
+                    roi_mode,
                     warning_cameras,
                 )
             else:
                 logging.info(
-                    "ACT attention visualization: %s on %s, ROI warning on %s; refresh %s.",
+                    "ACT attention visualization: %s on %s, ROI %s on %s; refresh %s.",
                     cam_name,
                     all_cameras,
+                    roi_mode,
                     warning_cameras,
                     cam_refresh,
                 )

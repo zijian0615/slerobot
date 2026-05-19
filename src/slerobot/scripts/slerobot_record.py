@@ -485,6 +485,7 @@ def record_loop(
                             edge_margin_px=policy.config.grad_cam_edge_margin_px,
                             edge_warning_mean=policy.last_grad_cam_edge_stats.get(image_key),
                             edge_warning_threshold=policy.config.grad_cam_edge_mean_threshold,
+                            edge_warning_roi_mode=policy.config.attention_roi_mode,
                         )
                         output_path = output_dir / f"camera_{camera_idx}_attention.png"
                         cv2.imwrite(str(output_path), cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
@@ -600,6 +601,9 @@ def record_loop(
                 grad_cam_edge_margin_px=policy.config.grad_cam_edge_margin_px
                 if isinstance(policy, ACTPolicy)
                 else None,
+                grad_cam_edge_roi_mode=policy.config.attention_roi_mode
+                if isinstance(policy, ACTPolicy)
+                else "mitigation",
                 attention_overlay_helper=policy.attention_overlay_helper
                 if isinstance(policy, ACTPolicy)
                 else ACTEigenCAMHelper,
@@ -662,8 +666,9 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                 cam_name = attention_cam_method_display_name(cfg.policy.attention_cam_method)
                 warning_label = cfg.policy.attention_camera or "all"
                 logging.info(
-                    "Enabling ACT %s on all cameras; ROI warning on: %s",
+                    "Enabling ACT %s on all cameras; ROI mode=%s on: %s",
                     cam_name,
+                    cfg.policy.attention_roi_mode,
                     warning_label,
                 )
                 cfg.policy.enable_attention_visualization = True

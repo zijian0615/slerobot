@@ -50,6 +50,7 @@ def log_rerun_data(
     grad_cam_edge_stats: dict[str, float] | None = None,
     grad_cam_edge_threshold: float | None = None,
     grad_cam_edge_margin_px: int | None = None,
+    grad_cam_edge_roi_mode: str = "mitigation",
     attention_overlay_helper: type = ACTEigenCAMHelper,
 ):
     for obs, val in observation.items():
@@ -73,6 +74,7 @@ def log_rerun_data(
                         edge_margin_px=grad_cam_edge_margin_px or 100,
                         edge_warning_mean=edge_mean,
                         edge_warning_threshold=grad_cam_edge_threshold,
+                        edge_warning_roi_mode=grad_cam_edge_roi_mode,
                     )
                     rr.log(f"observation.{obs}_attention", rr.Image(attn_overlay), static=True)
 
