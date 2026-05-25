@@ -9,7 +9,12 @@ from typing import Any
 
 from slerobot.motors import MotorCalibration
 
-from .lekiwi_ik import ARM_GRIPPER_KEY, ARM_JOINT_KEYS, LeKiwiQuestIK
+from .lekiwi_ik import (
+    ARM_GRIPPER_KEY,
+    ARM_JOINT_KEYS,
+    SimpleLeKiwiQuestIK,
+    observation_to_joint_degrees,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,31 +25,19 @@ class LeKiwiQuestMapperConfig:
 
     use_ik: bool = True
     urdf_path: str | None = None
-    # Fanuc VR MQTT: offsets from A-button zero (see ``vr_offset`` in lekiwi_ik).
-    quest_pose_mode: str = "vr_offset"
     quest_axis_remap: str = "z,-x,y"
-    apply_quest_rotation: bool = False
     use_degrees: bool = False
-    quest_position_scale: float = 1.0
-    ee_position_scale_mm: float = 0.001
-    position_weight: float = 1.0
-    orientation_weight: float = 0.0
-    max_delta_translation_m: float = 0.12
-    require_trigger: bool = True
-    settle_frames_after_zero: int = 12
-    warmup_frames_after_settle: int = 0
-    ramp_frames: int = 0
+    position_scale: float = 1.0
+    max_delta_m: float = 0.12
+    settle_frames: int = 12
     max_joint_step_deg: float = 8.0
-    position_deadzone_mm: float = 2.5
-    rotation_deadzone_deg: float = 3.0
-    quest_delta_ema_alpha: float = 0.65
-    joint_output_alpha: float = 0.55
-    resync_zero_during_settle: bool = True
+    ema_alpha: float = 0.6
+    deadzone_mm: float = 3.0
     gripper_open: float = 0.0
     gripper_closed: float = 100.0
     joystick_xy_speed: float = 0.15
     joystick_theta_speed: float = 45.0
-    # Legacy heuristic (only if use_ik=False or placo missing)
+    # Heuristic fallback (only if use_ik=False or placo unavailable)
     position_scale_pan: float = 80.0
     position_scale_lift: float = 80.0
     position_scale_elbow: float = 60.0
@@ -118,7 +111,7 @@ def _heuristic_arm_action(
     ref_x, ref_y, ref_z = reference_position
     ref_w, ref_p, ref_r = reference_orientation or (rw, rp, rr)
     dx, dy, dz = px - ref_x, py - ref_y, pz - ref_z
-    dw, dp, dr = rw - ref_w, rp - ref_p, rr - ref_r
+    dp, dr = rp - ref_p, rr - ref_r
 
     arm_action = {
         "arm_shoulder_pan.pos": float(observation.get("arm_shoulder_pan.pos", 0.0))
@@ -138,39 +131,28 @@ def _heuristic_arm_action(
 
 @dataclass
 class LeKiwiQuestMapper:
-    """Quest EE (Fanuc-style) -> LeKiwi joint targets via placo IK (default)."""
+    """Quest EE → LeKiwi joint targets via placo IK (default) or heuristic fallback."""
 
     config: LeKiwiQuestMapperConfig = field(default_factory=LeKiwiQuestMapperConfig)
     calibration: dict[str, MotorCalibration] | None = None
     reference_position: tuple[float, float, float] | None = None
     reference_orientation: tuple[float, float, float] | None = None
-    _ik: LeKiwiQuestIK | None = field(default=None, repr=False)
+    _ik: SimpleLeKiwiQuestIK | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.config.use_ik:
             return
         try:
             urdf = Path(self.config.urdf_path) if self.config.urdf_path else None
-            self._ik = LeKiwiQuestIK(
+            self._ik = SimpleLeKiwiQuestIK(
                 urdf,
-                quest_pose_mode=self.config.quest_pose_mode,  # type: ignore[arg-type]
                 quest_axis_remap=self.config.quest_axis_remap,
-                apply_quest_rotation=self.config.apply_quest_rotation,
-                position_weight=self.config.position_weight,
-                orientation_weight=self.config.orientation_weight,
-                max_delta_translation_m=self.config.max_delta_translation_m,
-                require_trigger=self.config.require_trigger,
-                settle_frames_after_zero=self.config.settle_frames_after_zero,
-                warmup_frames_after_settle=self.config.warmup_frames_after_settle,
-                ramp_frames=self.config.ramp_frames,
+                position_scale=self.config.position_scale,
+                max_delta_m=self.config.max_delta_m,
+                settle_frames=self.config.settle_frames,
                 max_joint_step_deg=self.config.max_joint_step_deg,
-                position_deadzone_mm=self.config.position_deadzone_mm,
-                rotation_deadzone_deg=self.config.rotation_deadzone_deg,
-                quest_delta_ema_alpha=self.config.quest_delta_ema_alpha,
-                joint_output_alpha=self.config.joint_output_alpha,
-                resync_zero_during_settle=self.config.resync_zero_during_settle,
-                quest_position_scale=self.config.quest_position_scale,
-                ee_position_scale_mm=self.config.ee_position_scale_mm,
+                ema_alpha=self.config.ema_alpha,
+                deadzone_mm=self.config.deadzone_mm,
                 use_degrees=self.config.use_degrees,
                 calibration=self.calibration,
             )

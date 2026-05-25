@@ -57,7 +57,9 @@ def _fmt_controller(quest_action: dict[str, Any]) -> str:
     rot = quest_action.get("rotation", {})
     btn = quest_action.get("buttons", {})
     return (
-        f"controller     {_fmt_xyz_wpr(float(pos.get('x', 0)), float(pos.get('y', 0)), float(pos.get('z', 0)), float(rot.get('w', 0)), float(rot.get('p', 0)), float(rot.get('r', 0)))} "
+        f"controller     "
+        f"xyz_mm=({float(pos.get('x', 0)):.1f},{float(pos.get('y', 0)):.1f},{float(pos.get('z', 0)):.1f}) "
+        f"wpr=({float(rot.get('w', 0)):.1f},{float(rot.get('p', 0)):.1f},{float(rot.get('r', 0)):.1f}) "
         f"btn(A={int(btn.get('a', 0))} trig={int(btn.get('trigger', 0))} grip={int(btn.get('grip', 0))})"
     )
 
@@ -78,7 +80,7 @@ def build_teleop_alignment_lines(
     mapped_action: dict[str, Any],
     quest_mapper: Any | None = None,
 ) -> list[str]:
-    """Controller pose, RA EE pose (FK), RA joint norm — same timestep."""
+    """Controller pose, robot EE pose (FK), robot joint norm — same timestep."""
     lines = [_fmt_controller(quest_action)]
 
     ik = getattr(quest_mapper, "_ik", None) if quest_mapper is not None else None
@@ -107,26 +109,18 @@ def build_teleop_alignment_lines(
         t_cmd = ik.kinematics.forward_kinematics(cmd_deg)
         px, py, pz, pw, pp, pr = transform_to_fanuc_mm_wpr(t_present)
         cx, cy, cz, cw, cp, cr = transform_to_fanuc_mm_wpr(t_cmd)
-        lines.insert(
-            1,
-            f"ra_ee_present  {_fmt_xyz_wpr(px, py, pz, pw, pp, pr)}",
-        )
+        lines.insert(1, f"ra_ee_present  {_fmt_xyz_wpr(px, py, pz, pw, pp, pr)}")
         lines.insert(2, f"ra_ee_command  {_fmt_xyz_wpr(cx, cy, cz, cw, cp, cr)}")
 
-        if getattr(ik, "_vr_zeroed", False):
-            pos = quest_action.get("position", {})
-            rot = quest_action.get("rotation", {})
-            qx = float(pos.get("x", 0.0))
-            qy = float(pos.get("y", 0.0))
-            qz = float(pos.get("z", 0.0))
-            qw = float(rot.get("w", 0.0))
-            qp = float(rot.get("p", 0.0))
-            qr = float(rot.get("r", 0.0))
-            dx, dy, dz, dw, dp, dr = ik._quest_offsets_from_zero(qx, qy, qz, qw, qp, qr)
-            lines[0] += f"  vs_neutral_mm=({dx:.2f},{dy:.2f},{dz:.2f}) d_wpr=({dw:.1f},{dp:.1f},{dr:.1f})"
-            if ik._filtered_delta is not None:
-                fd = ik._filtered_delta
-                lines[0] += f"  smoothed_mm=({fd[0]:.2f},{fd[1]:.2f},{fd[2]:.2f})"
+        # Show Quest delta from zero when armed
+        if getattr(ik, "is_armed", False):
+            delta = ik.quest_delta_mm(quest_action)
+            if delta is not None:
+                dx, dy, dz = delta
+                lines[0] += f"  quest_delta_mm=({dx:.1f},{dy:.1f},{dz:.1f})"
+            if ik._neutral_T is not None:
+                nx, ny, nz = ik._neutral_T[:3, 3] * 1000.0
+                lines[0] += f"  neutral_ee_mm=({nx:.1f},{ny:.1f},{nz:.1f})"
     else:
         lines.insert(1, "ra_ee_present  (IK/placo unavailable — joints only)")
 
@@ -183,7 +177,7 @@ def log_lekiwi_action_debug(
     if not action_debug_enabled():
         return
 
-    # Mac mapper stage: print controller / RA EE / RA joints in one aligned block.
+    # Mac mapper stage: print controller / robot EE / joints in one aligned block.
     if (
         stage == "mac_after_mapper"
         and quest_action is not None

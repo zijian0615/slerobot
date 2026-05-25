@@ -12,8 +12,9 @@ python -m slerobot.scripts.slerobot_lekiwi_record \
 
 # Pi: python -m slerobot.robots.lekiwi.lekiwi_host --no-cameras
 # Mac IK: pip install -e ".[kinematics]"
-# Arm: press A once (only A arms), hold trigger ~0.6s still, then move hand
+# Arm: press A (keep hand still ~settle_frames/20s) → ARMED → hold trigger to move
 # Tune: --position_scale=0.7  --quest_axis_remap=z,-x,y  (try x,y,z if axes feel wrong)
+#       --settle_frames=12  --ema_alpha=0.6  --deadzone_mm=3.0
 ```
 """
 
@@ -95,15 +96,12 @@ class LeKiwiRecordConfig:
     mqtt_broker: str = "10.22.9.10"
     mqtt_port: int = 1883
     mqtt_topic: str = "quest/data"
-    quest_pose_mode: str = "vr_offset"
     quest_axis_remap: str = "z,-x,y"
     position_scale: float = 1.0
-    orientation_weight: float = 0.0
     max_joint_step_deg: float = 8.0
-    quest_delta_ema_alpha: float = 0.65
-    joint_output_alpha: float = 0.55
-    position_deadzone_mm: float = 2.5
-    rotation_deadzone_deg: float = 3.0
+    ema_alpha: float = 0.6
+    deadzone_mm: float = 3.0
+    settle_frames: int = 12
     display_data: bool = False
     display_ip: str | None = None
     display_port: int | None = None
@@ -116,15 +114,12 @@ class LeKiwiRecordConfig:
 def _make_quest_mapper(cfg: LeKiwiRecordConfig) -> LeKiwiQuestMapper:
     return LeKiwiQuestMapper(
         config=LeKiwiQuestMapperConfig(
-            quest_pose_mode=cfg.quest_pose_mode,
             quest_axis_remap=cfg.quest_axis_remap,
-            quest_position_scale=cfg.position_scale,
-            orientation_weight=cfg.orientation_weight,
+            position_scale=cfg.position_scale,
             max_joint_step_deg=cfg.max_joint_step_deg,
-            quest_delta_ema_alpha=cfg.quest_delta_ema_alpha,
-            joint_output_alpha=cfg.joint_output_alpha,
-            position_deadzone_mm=cfg.position_deadzone_mm,
-            rotation_deadzone_deg=cfg.rotation_deadzone_deg,
+            ema_alpha=cfg.ema_alpha,
+            deadzone_mm=cfg.deadzone_mm,
+            settle_frames=cfg.settle_frames,
         )
     )
 
