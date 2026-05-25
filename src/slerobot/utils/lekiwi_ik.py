@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -141,23 +141,33 @@ def quest_a_button_pressed(quest_action: dict[str, Any]) -> bool:
     return False
 
 
+QuestPoseMode = Literal["relative_to_a", "absolute_pair"]
+
+
 class LeKiwiQuestIK:
-    """Relative Quest EE deltas applied on the robot FK pose, then solved with IK."""
+    """Map Quest EE commands to joint targets via placo IK.
+
+    ``relative_to_a`` (default, Fanuc VR app): MQTT x,y,z,w,p,r are already offsets from
+    the last A-button zero — do not subtract a second reference frame.
+    ``absolute_pair``: legacy mode, delta between latched reference pose and current pose.
+    """
 
     def __init__(
         self,
         urdf_path: str | Path | None = None,
         *,
+        quest_pose_mode: QuestPoseMode = "relative_to_a",
         position_weight: float = 1.0,
         orientation_weight: float = 0.05,
-        quest_position_scale: float = 1.0,
+        quest_position_scale: float = 0.5,
         ee_position_scale_mm: float = 0.001,
-        max_delta_translation_m: float = 0.12,
+        max_delta_translation_m: float = 0.08,
         use_degrees: bool = False,
         calibration: dict[str, MotorCalibration] | None = None,
     ) -> None:
         path = Path(urdf_path) if urdf_path else default_so101_urdf_path()
         self.kinematics = RobotKinematics(path, joint_names=list(SO101_ARM_JOINT_NAMES))
+        self.quest_pose_mode = quest_pose_mode
         self.position_weight = position_weight
         self.orientation_weight = orientation_weight
         self.quest_position_scale = quest_position_scale
@@ -169,11 +179,13 @@ class LeKiwiQuestIK:
         self._ref_position: tuple[float, float, float] | None = None
         self._ref_orientation: tuple[float, float, float] | None = None
         self._prev_a_pressed: bool = False
+        self._armed: bool = False
 
     def reset(self) -> None:
         self._ref_position = None
         self._ref_orientation = None
         self._prev_a_pressed = False
+        self._armed = False
 
     def _realign_reference(
         self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
@@ -181,7 +193,7 @@ class LeKiwiQuestIK:
         self._ref_position = (px, py, pz)
         self._ref_orientation = (rw, rp, rr)
 
-    def _handle_a_button(
+    def _on_a_button_edge(
         self,
         quest_action: dict[str, Any],
         px: float,
@@ -191,15 +203,95 @@ class LeKiwiQuestIK:
         rp: float,
         rr: float,
     ) -> bool:
-        """On A-button rising edge, realign Quest reference (typical 'start teleop' gesture)."""
+        """A-button rising edge: Fanuc-style VR zero (arm teleop armed, no motion this frame)."""
         pressed = quest_a_button_pressed(quest_action)
         rising = pressed and not self._prev_a_pressed
         self._prev_a_pressed = pressed
         if rising:
-            self._realign_reference(px, py, pz, rw, rp, rr)
-            logger.info("Quest A pressed — IK reference realigned to current controller pose.")
+            self._armed = True
+            if self.quest_pose_mode == "absolute_pair":
+                self._realign_reference(px, py, pz, rw, rp, rr)
+            logger.info(
+                "Quest A pressed — arm teleop armed (mode=%s, VR offsets from zero).",
+                self.quest_pose_mode,
+            )
             return True
         return False
+
+    def _delta_matrix_from_quest(
+        self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
+    ) -> np.ndarray:
+        scale = self.quest_position_scale * self.ee_position_scale_mm
+        return fanuc_pose_to_matrix(px, py, pz, rw, rp, rr, position_scale=scale)
+
+    def _solve_relative_to_a(
+        self,
+        px: float,
+        py: float,
+        pz: float,
+        rw: float,
+        rp: float,
+        rr: float,
+        current_deg: np.ndarray,
+    ) -> np.ndarray:
+        """Quest values are already offset from A-zero; apply once on robot FK."""
+        t_delta = self._delta_matrix_from_quest(px, py, pz, rw, rp, rr)
+        delta_m = float(np.linalg.norm(t_delta[:3, 3]))
+        if delta_m > self.max_delta_translation_m:
+            logger.warning(
+                "Quest offset %.3f m exceeds cap %.3f m — clamping (check mm vs m units).",
+                delta_m,
+                self.max_delta_translation_m,
+            )
+            if delta_m > 1e-9:
+                t_delta[:3, 3] *= self.max_delta_translation_m / delta_m
+
+        t_current = self.kinematics.forward_kinematics(current_deg)
+        t_target = t_current @ t_delta
+        return self.kinematics.inverse_kinematics(
+            current_deg,
+            t_target,
+            position_weight=self.position_weight,
+            orientation_weight=self.orientation_weight,
+        )
+
+    def _solve_absolute_pair(
+        self,
+        px: float,
+        py: float,
+        pz: float,
+        rw: float,
+        rp: float,
+        rr: float,
+        current_deg: np.ndarray,
+    ) -> np.ndarray:
+        if self._ref_position is None:
+            self._realign_reference(px, py, pz, rw, rp, rr)
+            return current_deg
+
+        ref_x, ref_y, ref_z = self._ref_position
+        ref_w, ref_p, ref_r = self._ref_orientation or (rw, rp, rr)
+        t_ref = self._delta_matrix_from_quest(ref_x, ref_y, ref_z, ref_w, ref_p, ref_r)
+        t_now = self._delta_matrix_from_quest(px, py, pz, rw, rp, rr)
+        t_delta = t_now @ np.linalg.inv(t_ref)
+
+        delta_m = float(np.linalg.norm(t_delta[:3, 3]))
+        if delta_m > self.max_delta_translation_m:
+            logger.warning(
+                "Quest pose jump %.3f m — realigning reference.",
+                delta_m,
+            )
+            self._realign_reference(px, py, pz, rw, rp, rr)
+            return current_deg
+
+        t_current = self.kinematics.forward_kinematics(current_deg)
+        t_target = t_current @ t_delta
+        return self.kinematics.inverse_kinematics(
+            current_deg,
+            t_target,
+            position_weight=self.position_weight,
+            orientation_weight=self.orientation_weight,
+        )
 
     def solve(
         self,
@@ -219,50 +311,24 @@ class LeKiwiQuestIK:
             observation, self.calibration, use_degrees=self.use_degrees
         )
 
-        if self._handle_a_button(quest_action, px, py, pz, rw, rp, rr):
-            return joint_degrees_to_arm_action(
-                current_deg, self.calibration, use_degrees=self.use_degrees
-            )
+        hold = joint_degrees_to_arm_action(
+            current_deg, self.calibration, use_degrees=self.use_degrees
+        )
 
-        if self._ref_position is None:
-            self._realign_reference(px, py, pz, rw, rp, rr)
-            return joint_degrees_to_arm_action(
-                current_deg, self.calibration, use_degrees=self.use_degrees
-            )
+        if self._on_a_button_edge(quest_action, px, py, pz, rw, rp, rr):
+            return hold
 
-        ref_x, ref_y, ref_z = self._ref_position
-        ref_w, ref_p, ref_r = self._ref_orientation or (rw, rp, rr)
-
-        scale = self.quest_position_scale * self.ee_position_scale_mm
-        t_ref = fanuc_pose_to_matrix(ref_x, ref_y, ref_z, ref_w, ref_p, ref_r, position_scale=scale)
-        t_now = fanuc_pose_to_matrix(px, py, pz, rw, rp, rr, position_scale=scale)
-        t_delta = t_now @ np.linalg.inv(t_ref)
-
-        delta_m = float(np.linalg.norm(t_delta[:3, 3]))
-        if delta_m > self.max_delta_translation_m:
-            logger.warning(
-                "Quest pose jump %.3f m > %.3f m — realigning IK reference (check A-button / MQTT units).",
-                delta_m,
-                self.max_delta_translation_m,
-            )
-            self._realign_reference(px, py, pz, rw, rp, rr)
-            return joint_degrees_to_arm_action(
-                current_deg, self.calibration, use_degrees=self.use_degrees
-            )
-
-        t_current = self.kinematics.forward_kinematics(current_deg)
-        t_target = t_current @ t_delta
+        if self.quest_pose_mode == "relative_to_a" and not self._armed:
+            return hold
 
         try:
-            target_deg = self.kinematics.inverse_kinematics(
-                current_deg,
-                t_target,
-                position_weight=self.position_weight,
-                orientation_weight=self.orientation_weight,
-            )
+            if self.quest_pose_mode == "relative_to_a":
+                target_deg = self._solve_relative_to_a(px, py, pz, rw, rp, rr, current_deg)
+            else:
+                target_deg = self._solve_absolute_pair(px, py, pz, rw, rp, rr, current_deg)
         except Exception as exc:
             logger.warning("IK failed (%s); holding current joints.", exc)
-            target_deg = current_deg
+            return hold
 
         return joint_degrees_to_arm_action(
             target_deg, self.calibration, use_degrees=self.use_degrees

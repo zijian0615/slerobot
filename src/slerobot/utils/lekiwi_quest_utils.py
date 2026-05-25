@@ -20,8 +20,10 @@ class LeKiwiQuestMapperConfig:
 
     use_ik: bool = True
     urdf_path: str | None = None
+    # Fanuc VR: x,y,z,w,p,r are offsets from A-button zero (not absolute cell pose).
+    quest_pose_mode: str = "relative_to_a"
     use_degrees: bool = False
-    quest_position_scale: float = 1.0
+    quest_position_scale: float = 0.5
     ee_position_scale_mm: float = 0.001
     position_weight: float = 1.0
     orientation_weight: float = 0.05
@@ -139,6 +141,7 @@ class LeKiwiQuestMapper:
             urdf = Path(self.config.urdf_path) if self.config.urdf_path else None
             self._ik = LeKiwiQuestIK(
                 urdf,
+                quest_pose_mode=self.config.quest_pose_mode,  # type: ignore[arg-type]
                 position_weight=self.config.position_weight,
                 orientation_weight=self.config.orientation_weight,
                 max_delta_translation_m=self.config.max_delta_translation_m,
