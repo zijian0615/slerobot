@@ -195,6 +195,7 @@ class LeKiwiQuestIK:
         self._zero_pose: tuple[float, float, float, float, float, float] | None = None
         self._settle_frames: int = 0
         self._logged_waiting_for_enable: bool = False
+        self._logged_near_zero_offset: bool = False
 
     def reset(self) -> None:
         self._ref_position = None
@@ -205,12 +206,28 @@ class LeKiwiQuestIK:
         self._zero_pose = None
         self._settle_frames = 0
         self._logged_waiting_for_enable = False
+        self._logged_near_zero_offset = False
 
     def _realign_reference(
         self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
     ) -> None:
         self._ref_position = (px, py, pz)
         self._ref_orientation = (rw, rp, rr)
+
+    def _latch_vr_zero(
+        self, px: float, py: float, pz: float, rw: float, rp: float, rr: float, *, source: str
+    ) -> None:
+        self._zero_pose = (px, py, pz, rw, rp, rr)
+        self._vr_zeroed = True
+        self._settle_frames = self.settle_frames_after_zero
+        self._logged_waiting_for_enable = False
+        logger.info(
+            "Quest %s — VR zero latched (x=%.1f y=%.1f z=%.1f). Hold trigger, then move.",
+            source,
+            px,
+            py,
+            pz,
+        )
 
     def _update_button_edges(
         self,
@@ -222,25 +239,21 @@ class LeKiwiQuestIK:
         rp: float,
         rr: float,
     ) -> bool:
-        """A rising only: latch VR zero pose (Fanuc). Returns True to hold arm this frame."""
+        """A or trigger rising: latch VR zero (Fanuc). Returns True to hold arm this frame."""
         a_pressed = quest_a_button_pressed(quest_action)
         a_rising = a_pressed and not self._prev_a_pressed
         self._prev_a_pressed = a_pressed
 
-        self._prev_trigger_pressed = quest_trigger_pressed(quest_action)
+        trigger_pressed = quest_trigger_pressed(quest_action)
+        trigger_rising = trigger_pressed and not self._prev_trigger_pressed
+        self._prev_trigger_pressed = trigger_pressed
 
-        if a_rising and self.quest_pose_mode == "relative_to_a":
-            self._zero_pose = (px, py, pz, rw, rp, rr)
-            self._vr_zeroed = True
-            self._settle_frames = self.settle_frames_after_zero
-            self._logged_waiting_for_enable = False
-            logger.info(
-                "Quest A — VR zero latched (x=%.1f y=%.1f z=%.1f). "
-                "Hold trigger, then move controller.",
-                px,
-                py,
-                pz,
-            )
+        if (a_rising or trigger_rising) and self.quest_pose_mode == "relative_to_a":
+            source = "A" if a_rising else "trigger"
+            if a_rising and trigger_rising:
+                source = "A+trigger"
+            self._latch_vr_zero(px, py, pz, rw, rp, rr, source=source)
+            self._logged_near_zero_offset = False
             return True
 
         if a_rising and self.quest_pose_mode == "absolute_pair":
@@ -353,11 +366,28 @@ class LeKiwiQuestIK:
         if self.quest_pose_mode == "relative_to_a" and not self._vr_zeroed:
             if not self._logged_waiting_for_enable:
                 logger.info(
-                    "Arm teleop idle — press Quest A once to set VR zero, "
-                    "then hold trigger and move."
+                    "Arm teleop idle — press Quest A (in VR) then squeeze trigger once "
+                    "(or press trigger once if A is not in MQTT), then move hand."
                 )
                 self._logged_waiting_for_enable = True
             return hold
+
+        if self.quest_pose_mode == "relative_to_a" and self._vr_zeroed:
+            dx, dy, dz, dw, dp, dr = self._quest_offsets_from_zero(px, py, pz, rw, rp, rr)
+            if (
+                not self._logged_near_zero_offset
+                and quest_trigger_pressed(quest_action)
+                and max(abs(dx), abs(dy), abs(dz)) < 0.5
+                and max(abs(dw), abs(dp), abs(dr)) < 0.5
+            ):
+                logger.warning(
+                    "Quest pose not changing (dx=%.2f dy=%.2f dz=%.2f) while trigger held — "
+                    "check MQTT: mosquitto_sub -t quest/data, expect x/y/z or px/py/pz to move.",
+                    dx,
+                    dy,
+                    dz,
+                )
+                self._logged_near_zero_offset = True
 
         if self._settle_frames > 0:
             self._settle_frames -= 1

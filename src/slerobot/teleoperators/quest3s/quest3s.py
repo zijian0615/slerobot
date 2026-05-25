@@ -267,19 +267,75 @@ class Quest3sController(Teleoperator):
     #             'grip': payload.get('gripButton', 0),
     #         }
     #     }
+    @staticmethod
+    def _pick_float(payload: dict, *keys: str, default: float = 0.0) -> float:
+        for key in keys:
+            if key in payload and payload[key] is not None:
+                return float(payload[key])
+        return default
+
+    @staticmethod
+    def _vec_norm3(x: float, y: float, z: float) -> float:
+        return abs(x) + abs(y) + abs(z)
+
+    def _parse_position(self, payload: dict) -> tuple[float, float, float]:
+        """Fanuc x/y/z vs Quest px/py/pz: some apps keep x,y,z at 0 and stream px,py,pz."""
+        fanuc_present = any(k in payload for k in ("x", "y", "z"))
+        quest_present = any(k in payload for k in ("px", "py", "pz"))
+        fx = self._pick_float(payload, "x", default=0.0)
+        fy = self._pick_float(payload, "y", default=0.0)
+        fz = self._pick_float(payload, "z", default=0.0)
+        px = self._pick_float(payload, "px", "posX", "positionX", default=0.0)
+        py = self._pick_float(payload, "py", "posY", "positionY", default=0.0)
+        pz = self._pick_float(payload, "pz", "posZ", "positionZ", default=0.0)
+        if quest_present and (
+            not fanuc_present
+            or (
+                self._vec_norm3(fx, fy, fz) < 1e-9
+                and self._vec_norm3(px, py, pz) > self._vec_norm3(fx, fy, fz)
+            )
+        ):
+            return px, py, pz
+        if fanuc_present:
+            return fx, fy, fz
+        return (
+            self._pick_float(payload, "x", "px", "posX", "positionX"),
+            self._pick_float(payload, "y", "py", "posY", "positionY"),
+            self._pick_float(payload, "z", "pz", "posZ", "positionZ"),
+        )
+
+    def _parse_rotation(self, payload: dict) -> tuple[float, float, float]:
+        fanuc_present = any(k in payload for k in ("w", "p", "r"))
+        quest_present = any(k in payload for k in ("rw", "rp", "rr"))
+        fw = self._pick_float(payload, "w", default=0.0)
+        fp = self._pick_float(payload, "p", default=0.0)
+        fr = self._pick_float(payload, "r", default=0.0)
+        rw = self._pick_float(payload, "rw", "rotW", default=0.0)
+        rp = self._pick_float(payload, "rp", "rotP", default=0.0)
+        rr = self._pick_float(payload, "rr", "rotR", default=0.0)
+        if quest_present and (
+            not fanuc_present
+            or (
+                self._vec_norm3(fw, fp, fr) < 1e-9
+                and self._vec_norm3(rw, rp, rr) > self._vec_norm3(fw, fp, fr)
+            )
+        ):
+            return rw, rp, rr
+        if fanuc_present:
+            return fw, fp, fr
+        return (
+            self._pick_float(payload, "w", "rw", "rotW"),
+            self._pick_float(payload, "p", "rp", "rotP"),
+            self._pick_float(payload, "r", "rr", "rotR"),
+        )
+
     def _parse_payload(self, payload: dict, timestamp: datetime) -> dict:
+        x, y, z = self._parse_position(payload)
+        w, p, r = self._parse_rotation(payload)
         result = {
             'timestamp': timestamp,
-            'position': {
-                'x': payload.get('x', 0.0),
-                'y': payload.get('y', 0.0),
-                'z': payload.get('z', 0.0),
-            },
-            'rotation': {
-                'w': payload.get('w', 0.0),
-                'p': payload.get('p', 0.0),
-                'r': payload.get('r', 0.0),
-            },
+            'position': {'x': x, 'y': y, 'z': z},
+            'rotation': {'w': w, 'p': p, 'r': r},
             'buttons': {
                 'trigger': payload.get('triggerButton', 0),
                 'grip': payload.get('gripButton', 0),
