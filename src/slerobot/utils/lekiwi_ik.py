@@ -225,6 +225,7 @@ class SimpleLeKiwiQuestIK:
         self._prev_a: bool = False
         self._prev_trigger: bool = False
         self._logged_idle: bool = False
+        self._idle_log_countdown: int = 0
 
     def reset(self) -> None:
         self._state = _State.IDLE
@@ -236,6 +237,7 @@ class SimpleLeKiwiQuestIK:
         self._prev_a = False
         self._prev_trigger = False
         self._logged_idle = False
+        self._idle_log_countdown = 0
 
     # ── public property for debug compatibility ──────────────────────────────
 
@@ -327,6 +329,22 @@ class SimpleLeKiwiQuestIK:
             if not self._logged_idle:
                 logger.info("Arm teleop idle — press Quest A to arm.")
                 self._logged_idle = True
+                self._idle_log_countdown = 0
+            # Periodically log button state so the user can confirm A is detected
+            self._idle_log_countdown -= 1
+            if self._idle_log_countdown <= 0:
+                btns = quest_action.get("buttons", {})
+                pos = quest_action.get("position", {})
+                logger.info(
+                    "Quest state — A=%s trig=%s grip=%s | pos_mm=(%.1f, %.1f, %.1f)",
+                    btns.get("a", "?"),
+                    btns.get("trigger", "?"),
+                    btns.get("grip", "?"),
+                    float(pos.get("x", 0)),
+                    float(pos.get("y", 0)),
+                    float(pos.get("z", 0)),
+                )
+                self._idle_log_countdown = 100  # log every ~5s at 20Hz
             return self._hold_last(current_joints)
 
         # ── ARMED: trigger release → freeze ──────────────────────────────
