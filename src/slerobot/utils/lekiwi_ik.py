@@ -459,25 +459,6 @@ class LeKiwiQuestIK:
                 self._logged_waiting_for_enable = True
             return hold
 
-        if self.quest_pose_mode == "relative_to_a" and self._vr_zeroed:
-            dx, dy, dz, dw, dp, dr = self._quest_delta_for_ik(px, py, pz, rw, rp, rr)
-            if (
-                not self._logged_near_zero_offset
-                and quest_trigger_pressed(quest_action)
-                and self._settle_frames == 0
-                and self._warmup_frames == 0
-                and max(abs(dx), abs(dy), abs(dz)) < 0.5
-                and max(abs(dw), abs(dp), abs(dr)) < 0.5
-            ):
-                logger.warning(
-                    "Quest pose not changing (dx=%.2f dy=%.2f dz=%.2f) while trigger held — "
-                    "check MQTT: mosquitto_sub -t quest/data, expect x/y/z or px/py/pz to move.",
-                    dx,
-                    dy,
-                    dz,
-                )
-                self._logged_near_zero_offset = True
-
         if self._settle_frames > 0:
             if self.resync_zero_during_settle:
                 self._sync_zero_pose(px, py, pz, rw, rp, rr)
@@ -504,6 +485,18 @@ class LeKiwiQuestIK:
 
         dx, dy, dz, dw, dp, dr = self._quest_delta_for_ik(px, py, pz, rw, rp, rr)
         if self._pose_delta_below_deadzone(dx, dy, dz, dw, dp, dr):
+            if (
+                not self._logged_near_zero_offset
+                and quest_trigger_pressed(quest_action)
+            ):
+                logger.info(
+                    "Quest delta within deadzone (dx=%.2f dy=%.2f dz=%.2f mm) — arm holding. "
+                    "Move controller to teleop; large x/y/z in logs are Fanuc absolute mm, not error.",
+                    dx,
+                    dy,
+                    dz,
+                )
+                self._logged_near_zero_offset = True
             return hold
 
         try:

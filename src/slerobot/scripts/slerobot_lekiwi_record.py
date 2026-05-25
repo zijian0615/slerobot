@@ -15,6 +15,10 @@ python -m slerobot.scripts.slerobot_lekiwi_record \
 # Mac record (default robot.use_cameras=false):
 #   pip install -e ".[kinematics]"   # placo IK: Quest EE -> arm joints
 #   ... same command, no extra flags
+# Lower arm sensitivity (hand moves less on robot):
+#   --quest_map.position_scale=0.2
+#   --quest_map.orientation_weight=0.02
+#   --quest_map.max_joint_step_deg=3
 # Copy Pi motor calibration to Mac (same joint ranges for IK):
 #   ~/.cache/huggingface/lerobot/calibration/robots/lekiwi/<pi-id>.json
 #   -> .../robots/lekiwi_client/lekiwi_client.json
@@ -49,7 +53,7 @@ from slerobot.scripts.slerobot_record import (
 from slerobot.teleoperators.lekiwi_keyboard import LeKiwiKeyboardTeleop
 from slerobot.teleoperators.quest3s import Quest3sController
 from slerobot.utils.control_utils import init_keyboard_listener, is_headless
-from slerobot.utils.lekiwi_quest_utils import LeKiwiQuestMapper
+from slerobot.utils.lekiwi_quest_utils import LeKiwiQuestMapper, LeKiwiQuestMapperConfig
 from slerobot.utils.utils import init_logging, log_say
 from slerobot.utils.visualization_utils import _init_rerun, shutdown_rerun
 
@@ -109,10 +113,21 @@ class LeKiwiRobotRecordConfig:
 
 
 @dataclass
+class LeKiwiQuestMapConfig:
+    """Quest → arm IK sensitivity (lower = smaller arm motion per hand move)."""
+
+    # MQTT position is mm; effective meters = mm * ee_position_scale_mm * position_scale.
+    position_scale: float = 0.5
+    orientation_weight: float = 0.05
+    max_joint_step_deg: float = 5.0
+
+
+@dataclass
 class LeKiwiRecordConfig:
     dataset: LeKiwiDatasetRecordConfig
     robot: LeKiwiRobotRecordConfig = field(default_factory=LeKiwiRobotRecordConfig)
     teleop: Quest3sConfig = field(default_factory=Quest3sConfig)
+    quest_map: LeKiwiQuestMapConfig = field(default_factory=LeKiwiQuestMapConfig)
     display_data: bool = False
     display_ip: str | None = None
     display_port: int | None = None
@@ -142,7 +157,19 @@ def record(cfg: LeKiwiRecordConfig) -> sLerobotDataset:
     )
     teleop_keyboard = LeKiwiKeyboardTeleop(teleop_keys=client_cfg.teleop_keys)
     teleop = [teleop_quest, teleop_keyboard]
-    quest_mapper = LeKiwiQuestMapper()
+    quest_mapper = LeKiwiQuestMapper(
+        config=LeKiwiQuestMapperConfig(
+            quest_position_scale=cfg.quest_map.position_scale,
+            orientation_weight=cfg.quest_map.orientation_weight,
+            max_joint_step_deg=cfg.quest_map.max_joint_step_deg,
+        )
+    )
+    logging.info(
+        "Quest arm sensitivity: position_scale=%.3f orientation_weight=%.3f max_joint_step_deg=%.1f",
+        cfg.quest_map.position_scale,
+        cfg.quest_map.orientation_weight,
+        cfg.quest_map.max_joint_step_deg,
+    )
 
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
     dataset_features = combine_feature_dicts(robot.observation_features, robot.action_features)
