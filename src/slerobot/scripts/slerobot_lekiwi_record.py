@@ -26,7 +26,7 @@ python -m slerobot.scripts.slerobot_lekiwi_record \
 # With cameras on both sides:
 #   add --robot.use_cameras=true
 #
-# Debug send_action (Mac + Pi):
+# Debug teleop alignment (Mac): controller pose / RA EE FK / RA joints (same frame)
 #   export SLEROBOT_DEBUG_ACTION=1
 #   export SLEROBOT_DEBUG_ACTION_HZ=5   # optional, max prints per second
 ```

@@ -536,6 +536,7 @@ def record_loop(
                 quest_action=quest_act,
                 observation=obs,
                 mapped_action=act_processed_teleop,
+                quest_mapper=quest_mapper,
             )
         elif policy is None and isinstance(teleop, list):
             teleop_arm, teleop_keyboard = teleop

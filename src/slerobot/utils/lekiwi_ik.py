@@ -24,6 +24,28 @@ ARM_GRIPPER_KEY = "arm_gripper.pos"
 STS3215_MAX_RES = 4095
 
 
+def rotation_matrix_to_wpr_deg(rotation: np.ndarray) -> tuple[float, float, float]:
+    """Inverse of intrinsic ZYX Fanuc convention used in ``wpr_deg_to_rotation_matrix``."""
+    r = rotation
+    p_rad = float(np.arcsin(np.clip(-r[2, 0], -1.0, 1.0)))
+    cp = np.cos(p_rad)
+    if abs(cp) > 1e-6:
+        w_rad = float(np.arctan2(r[1, 0], r[0, 0]))
+        r_rad = float(np.arctan2(r[2, 1], r[2, 2]))
+    else:
+        w_rad = float(np.arctan2(-r[0, 1], r[1, 1]))
+        r_rad = 0.0
+    w, p, r_deg = np.rad2deg([w_rad, p_rad, r_rad])
+    return float(w), float(p), float(r_deg)
+
+
+def transform_to_fanuc_mm_wpr(transform: np.ndarray) -> tuple[float, float, float, float, float, float]:
+    """EE pose as Fanuc-style mm + W,P,R degrees."""
+    x_mm, y_mm, z_mm = (transform[:3, 3] * 1000.0).tolist()
+    w, p, r = rotation_matrix_to_wpr_deg(transform[:3, :3])
+    return x_mm, y_mm, z_mm, w, p, r
+
+
 def wpr_deg_to_rotation_matrix(w_deg: float, p_deg: float, r_deg: float) -> np.ndarray:
     """Fanuc W,P,R (degrees) as intrinsic ZYX Euler angles."""
     w, p, r = np.deg2rad([w_deg, p_deg, r_deg])
