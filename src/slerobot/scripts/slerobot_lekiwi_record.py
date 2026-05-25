@@ -13,7 +13,11 @@ python -m slerobot.scripts.slerobot_lekiwi_record \
 # Pi runs without cameras:
 #   python -m slerobot.robots.lekiwi.lekiwi_host --no-cameras
 # Mac record (default robot.use_cameras=false):
+#   pip install -e ".[kinematics]"   # placo IK: Quest EE -> arm joints
 #   ... same command, no extra flags
+# Copy Pi motor calibration to Mac (same joint ranges for IK):
+#   ~/.cache/huggingface/lerobot/calibration/robots/lekiwi/<pi-id>.json
+#   -> .../robots/lekiwi_client/lekiwi_client.json
 # With cameras on both sides:
 #   add --robot.use_cameras=true
 ```
@@ -166,6 +170,20 @@ def record(cfg: LeKiwiRecordConfig) -> sLerobotDataset:
             client_cfg.port_zmq_observations,
         )
         robot.connect()
+        if robot.calibration:
+            quest_mapper.calibration = robot.calibration
+            if quest_mapper._ik is not None:
+                quest_mapper._ik.calibration = robot.calibration
+            logging.info(
+                "Loaded motor calibration (%d motors) for Quest IK.",
+                len(robot.calibration),
+            )
+        else:
+            logging.warning(
+                "No calibration file on this machine — IK uses approximate joint scaling. "
+                "Copy Pi calibration to %s",
+                robot.calibration_fpath,
+            )
         teleop_quest.connect()
         teleop_keyboard.connect()
         time.sleep(2.0)

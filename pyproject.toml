@@ -21,6 +21,12 @@ dependencies = [
     "pyzmq>=25.0",
 ]
 
+[project.optional-dependencies]
+kinematics = [
+    "placo>=0.9.0",
+    "scipy>=1.10",
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
@@ -28,7 +34,11 @@ package-dir = {"" = "src"}
 where = ["src"]
 include = ["slerobot*"]
 
+[tool.setuptools.package-data]
+slerobot = ["assets/urdf/*.urdf", "assets/urdf/assets/*.stl"]
+
 [project.scripts]
 slerobot-record = "slerobot.scripts.slerobot_record:record"
 slerobot-lekiwi-record = "slerobot.scripts.slerobot_lekiwi_record:record"
 slerobot-lekiwi-host = "slerobot.robots.lekiwi.lekiwi_host:main"
+slerobot-lekiwi-calibrate = "slerobot.scripts.slerobot_lekiwi_calibrate:main"

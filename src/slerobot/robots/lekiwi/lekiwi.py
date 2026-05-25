@@ -127,12 +127,12 @@ class LeKiwi(Robot):
         # Motors are required; cameras are optional (may fail on Pi USB bandwidth).
         return self.bus.is_connected
 
-    def connect(self, calibrate: bool = True) -> None:
+    def connect(self, calibrate: bool = True, force_recalibrate: bool = False) -> None:
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected")
 
         self.bus.connect()
-        self._ensure_bus_calibration(calibrate=calibrate)
+        self._ensure_bus_calibration(calibrate=calibrate, force_recalibrate=force_recalibrate)
 
         for cam_key, cam in self.cameras.items():
             try:
@@ -147,8 +147,13 @@ class LeKiwi(Robot):
     def is_calibrated(self) -> bool:
         return self.bus.is_calibrated
 
-    def _ensure_bus_calibration(self, *, calibrate: bool) -> None:
+    def _ensure_bus_calibration(self, *, calibrate: bool, force_recalibrate: bool = False) -> None:
         """Ensure self.bus.calibration is populated so sync_read/send_action work."""
+        if force_recalibrate and calibrate:
+            logger.info("Force recalibration requested — running interactive calibration.")
+            self.calibrate(force=True)
+            return
+
         if self.bus.calibration and _calibration_is_usable(self.bus.calibration):
             return
 
@@ -178,16 +183,21 @@ class LeKiwi(Robot):
             f"Or place a valid calibration file at:\n  {self.calibration_fpath}"
         )
 
-    def calibrate(self) -> None:
-        if self.calibration:
-            # Calibration file exists, ask user whether to use it or run new calibration
+    def calibrate(self, force: bool = False) -> None:
+        if self.calibration and not force:
             user_input = input(
-                f"Press ENTER to use provided calibration file associated with the id {self.id}, or type 'c' and press ENTER to run calibration: "
+                f"Press ENTER to use provided calibration file associated with the id {self.id}, "
+                "or type 'c' and press ENTER to run calibration: "
             )
             if user_input.strip().lower() != "c":
                 logger.info(f"Writing calibration file associated with the id {self.id} to the motors")
                 self.bus.write_calibration(self.calibration)
                 return
+        if force and self.calibration_fpath.is_file():
+            backup = self.calibration_fpath.with_suffix(".json.bak")
+            self.calibration_fpath.rename(backup)
+            logger.info("Backed up previous calibration to %s", backup)
+            self.calibration = {}
         logger.info(f"\nRunning calibration of {self}")
 
         motors = self.arm_motors + self.base_motors

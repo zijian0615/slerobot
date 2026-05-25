@@ -67,7 +67,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--calibrate",
         action="store_true",
-        help="Run interactive leader-style calibration once (not needed for Quest teleop).",
+        help="Run interactive calibration if motors have no valid calibration.",
+    )
+    parser.add_argument(
+        "--recalibrate",
+        action="store_true",
+        help="Force a new interactive calibration (backs up the old JSON, then exits after connect).",
     )
     parser.add_argument(
         "--connection-time-s",
@@ -101,8 +106,24 @@ def main(argv: list[str] | None = None) -> None:
     logger.info("Configuring LeKiwi (Quest / remote teleop host)")
     robot = LeKiwi(robot_config)
 
-    logger.info("Connecting LeKiwi (calibrate_on_connect=%s)", host_config.calibrate_on_connect)
-    robot.connect(calibrate=host_config.calibrate_on_connect)
+    force_recalibrate = args.recalibrate
+    calibrate_on_connect = host_config.calibrate_on_connect or force_recalibrate
+    logger.info(
+        "Connecting LeKiwi (calibrate=%s, force_recalibrate=%s)",
+        calibrate_on_connect,
+        force_recalibrate,
+    )
+    robot.connect(calibrate=calibrate_on_connect, force_recalibrate=force_recalibrate)
+
+    if force_recalibrate:
+        logger.info(
+            "Recalibration finished. Calibration file:\n  %s\n"
+            "Copy this file to your Mac for Quest IK:\n"
+            "  .../calibration/robots/lekiwi_client/lekiwi_client.json",
+            robot.calibration_fpath,
+        )
+        robot.disconnect()
+        return
 
     host = LeKiwiHost(host_config)
     last_cmd_time = time.time()
