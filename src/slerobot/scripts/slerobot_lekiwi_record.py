@@ -16,9 +16,10 @@ python -m slerobot.scripts.slerobot_lekiwi_record \
 #   pip install -e ".[kinematics]"   # placo IK: Quest EE -> arm joints
 #   ... same command, no extra flags
 # Lower arm sensitivity (hand moves less on robot):
-#   --quest_map.position_scale=0.2
+#   --quest_map.position_scale=0.5
 #   --quest_map.orientation_weight=0.02
-#   --quest_map.max_joint_step_deg=3
+#   --quest_map.max_joint_step_deg=8
+#   --quest_map.quest_delta_ema_alpha=0.4
 # Copy Pi motor calibration to Mac (same joint ranges for IK):
 #   ~/.cache/huggingface/lerobot/calibration/robots/lekiwi/<pi-id>.json
 #   -> .../robots/lekiwi_client/lekiwi_client.json
@@ -120,6 +121,9 @@ class LeKiwiQuestMapConfig:
     position_scale: float = 0.5
     orientation_weight: float = 0.05
     max_joint_step_deg: float = 5.0
+    quest_delta_ema_alpha: float = 0.55
+    position_deadzone_mm: float = 1.5
+    rotation_deadzone_deg: float = 1.5
 
 
 @dataclass
@@ -162,13 +166,19 @@ def record(cfg: LeKiwiRecordConfig) -> sLerobotDataset:
             quest_position_scale=cfg.quest_map.position_scale,
             orientation_weight=cfg.quest_map.orientation_weight,
             max_joint_step_deg=cfg.quest_map.max_joint_step_deg,
+            quest_delta_ema_alpha=cfg.quest_map.quest_delta_ema_alpha,
+            position_deadzone_mm=cfg.quest_map.position_deadzone_mm,
+            rotation_deadzone_deg=cfg.quest_map.rotation_deadzone_deg,
         )
     )
     logging.info(
-        "Quest arm sensitivity: position_scale=%.3f orientation_weight=%.3f max_joint_step_deg=%.1f",
+        "Quest arm sensitivity: position_scale=%.3f orientation_weight=%.3f "
+        "max_joint_step_deg=%.1f ema_alpha=%.2f deadzone_mm=%.1f",
         cfg.quest_map.position_scale,
         cfg.quest_map.orientation_weight,
         cfg.quest_map.max_joint_step_deg,
+        cfg.quest_map.quest_delta_ema_alpha,
+        cfg.quest_map.position_deadzone_mm,
     )
 
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
