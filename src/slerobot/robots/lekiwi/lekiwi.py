@@ -36,6 +36,9 @@ from .config_lekiwi import LeKiwiConfig
 
 logger = logging.getLogger(__name__)
 
+# Feetech sync_read on a busy 9-motor bus can sporadically return "Incorrect status packet".
+MOTOR_SYNC_READ_RETRIES = 3
+
 
 def _calibration_is_usable(calibration: dict[str, MotorCalibration]) -> bool:
     if not calibration:
@@ -83,6 +86,7 @@ class LeKiwi(Robot):
         self.arm_motors = [motor for motor in self.bus.motors if motor.startswith("arm")]
         self.base_motors = [motor for motor in self.bus.motors if motor.startswith("base")]
         self.cameras = make_cameras_from_configs(config.cameras)
+        self._last_observation: dict[str, Any] = {}
 
     @property
     def _state_ft(self) -> dict[str, type]:
@@ -387,25 +391,30 @@ class LeKiwi(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        # Read actuators position for arm and vel for base
         start = time.perf_counter()
-        arm_pos = self.bus.sync_read("Present_Position", self.arm_motors)
-        base_wheel_vel = self.bus.sync_read("Present_Velocity", self.base_motors)
-
-        base_vel = self._wheel_raw_to_body(
-            base_wheel_vel["base_left_wheel"],
-            base_wheel_vel["base_back_wheel"],
-            base_wheel_vel["base_right_wheel"],
-        )
-
-        arm_state = {f"{k}.pos": v for k, v in arm_pos.items()}
-
-        obs_dict = {**arm_state, **base_vel}
+        try:
+            arm_pos = self.bus.sync_read(
+                "Present_Position", self.arm_motors, num_retry=MOTOR_SYNC_READ_RETRIES
+            )
+            base_wheel_vel = self.bus.sync_read(
+                "Present_Velocity", self.base_motors, num_retry=MOTOR_SYNC_READ_RETRIES
+            )
+            base_vel = self._wheel_raw_to_body(
+                base_wheel_vel["base_left_wheel"],
+                base_wheel_vel["base_back_wheel"],
+                base_wheel_vel["base_right_wheel"],
+            )
+            arm_state = {f"{k}.pos": v for k, v in arm_pos.items()}
+            obs_dict = {**arm_state, **base_vel}
+        except ConnectionError as exc:
+            if self._last_observation:
+                logger.warning("Motor bus read failed, reusing last observation: %s", exc)
+                return dict(self._last_observation)
+            raise
 
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 
-        # Capture images from cameras
         for cam_key, cam in self.cameras.items():
             if not cam.is_connected:
                 continue
@@ -414,6 +423,7 @@ class LeKiwi(Robot):
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
+        self._last_observation = dict(obs_dict)
         return obs_dict
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
@@ -456,6 +466,7 @@ class LeKiwi(Robot):
 
     def stop_base(self):
         self.bus.sync_write("Goal_Velocity", dict.fromkeys(self.base_motors, 0), num_retry=5)
+        time.sleep(0.02)
         logger.info("Base motors stopped")
 
     def disconnect(self):

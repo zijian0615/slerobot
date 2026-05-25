@@ -28,6 +28,46 @@ class LeKiwiQuestMapperConfig:
     joystick_theta_speed: float = 45.0
 
 
+def _read_joystick(quest_action: dict[str, Any]) -> tuple[float, float, float]:
+    """Return (x, y, theta) stick values in [-1, 1] from Quest MQTT payload."""
+    keys_xy = (
+        ("joystickX", "joystickY"),
+        ("joystick_x", "joystick_y"),
+        ("thumbstickX", "thumbstickY"),
+        ("leftThumbstickX", "leftThumbstickY"),
+        ("axisX", "axisY"),
+        ("moveX", "moveY"),
+    )
+    jx, jy = 0.0, 0.0
+    for kx, ky in keys_xy:
+        if kx in quest_action or ky in quest_action:
+            jx = float(quest_action.get(kx, 0.0))
+            jy = float(quest_action.get(ky, 0.0))
+            break
+    jtheta = float(
+        quest_action.get(
+            "rightThumbstickX",
+            quest_action.get("rotateStickX", quest_action.get("joystickRX", 0.0)),
+        )
+    )
+    return jx, jy, jtheta
+
+
+def quest_base_action(quest_action: dict[str, Any], config: LeKiwiQuestMapperConfig) -> dict[str, float]:
+    jx, jy, jtheta = _read_joystick(quest_action)
+    if abs(jx) < 0.05 and abs(jy) < 0.05 and abs(jtheta) < 0.05:
+        return {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
+    return {
+        "x.vel": jy * config.joystick_xy_speed,
+        "y.vel": jx * config.joystick_xy_speed,
+        "theta.vel": jtheta * config.joystick_theta_speed,
+    }
+
+
+def base_action_is_active(base_action: dict[str, float]) -> bool:
+    return any(abs(float(v)) > 1e-6 for k, v in base_action.items() if k.endswith(".vel"))
+
+
 @dataclass
 class LeKiwiQuestMapper:
     """Incremental Quest pose -> LeKiwi joint targets using the current observation as state."""
@@ -86,22 +126,8 @@ class LeKiwiQuestMapper:
         else:
             arm_action["arm_gripper.pos"] = self.config.gripper_open
 
-        if base_action:
-            return {**arm_action, **base_action}
+        merged_base = quest_base_action(quest_action, self.config)
+        if base_action and base_action_is_active(base_action):
+            merged_base = {**merged_base, **base_action}
 
-        joystick_x = float(quest_action.get("joystick_x", quest_action.get("joystickX", 0.0)))
-        joystick_y = float(quest_action.get("joystick_y", quest_action.get("joystickY", 0.0)))
-        if joystick_x != 0.0 or joystick_y != 0.0:
-            return {
-                **arm_action,
-                "x.vel": joystick_y * self.config.joystick_xy_speed,
-                "y.vel": joystick_x * self.config.joystick_xy_speed,
-                "theta.vel": 0.0,
-            }
-
-        return {
-            **arm_action,
-            "x.vel": 0.0,
-            "y.vel": 0.0,
-            "theta.vel": 0.0,
-        }
+        return {**arm_action, **merged_base}

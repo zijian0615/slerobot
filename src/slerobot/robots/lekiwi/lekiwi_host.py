@@ -143,7 +143,15 @@ def main(argv: list[str] | None = None) -> None:
                 watchdog_active = True
                 robot.stop_base()
 
-            last_observation = robot.get_observation()
+            try:
+                last_observation = robot.get_observation()
+            except ConnectionError as exc:
+                logger.error(
+                    "Motor bus read failed (check USB /dev/ttyACM0, power, and motor IDs): %s",
+                    exc,
+                )
+                time.sleep(0.05)
+                continue
 
             for cam_key, cam in robot.cameras.items():
                 if not cam.is_connected or cam_key not in last_observation:

@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 from typing import Any
 
 from ..teleoperator import Teleoperator
 
 logger = logging.getLogger(__name__)
+
+_MAC_ACCESSIBILITY_HINT = (
+    "macOS 未授予「辅助功能」权限，WASD 底盘键盘无效。请到："
+    "系统设置 → 隐私与安全性 → 辅助功能 → 勾选 Terminal / iTerm / Python，然后重启录制。"
+    " 或改用 Quest 手柄摇杆控制底盘（MQTT 需包含 joystickX/Y 等字段）。"
+)
 
 
 class LeKiwiKeyboardTeleop(Teleoperator):
@@ -27,7 +34,6 @@ class LeKiwiKeyboardTeleop(Teleoperator):
         self._pressed: set[str] = set()
         self._listener = None
         self.is_connected = False
-
     def connect(self) -> None:
         try:
             from pynput import keyboard
@@ -54,6 +60,8 @@ class LeKiwiKeyboardTeleop(Teleoperator):
         self._listener.start()
         self.is_connected = True
         logger.info("[LeKiwiKeyboard] Listening for base motion keys: %s", self.teleop_keys)
+        if sys.platform == "darwin":
+            logger.warning(_MAC_ACCESSIBILITY_HINT)
 
     def disconnect(self) -> None:
         if self._listener is not None:

@@ -9,6 +9,13 @@ python -m slerobot.scripts.slerobot_lekiwi_record \
     --robot.remote_ip=10.22.26.30  \
     --teleop.mqtt_broker=10.22.9.10 \
     --teleop.mqtt_topic=quest/data
+
+# Pi runs without cameras:
+#   python -m slerobot.robots.lekiwi.lekiwi_host --no-cameras
+# Mac record (default robot.use_cameras=false):
+#   ... same command, no extra flags
+# With cameras on both sides:
+#   add --robot.use_cameras=true
 ```
 """
 
@@ -54,8 +61,11 @@ class LeKiwiRobotRecordConfig:
     polling_timeout_ms: int = 100
     connect_timeout_s: int = 10
     id: str = "lekiwi_client"
+    # Set false when Pi host runs with `--no-cameras` (proprio-only dataset).
+    use_cameras: bool = False
 
     def to_client_config(self) -> LeKiwiClientConfig:
+        cameras = lekiwi_cameras_config() if self.use_cameras else {}
         return LeKiwiClientConfig(
             id=self.id,
             remote_ip=self.remote_ip,
@@ -63,7 +73,7 @@ class LeKiwiRobotRecordConfig:
             port_zmq_observations=self.port_zmq_observations,
             polling_timeout_ms=self.polling_timeout_ms,
             connect_timeout_s=self.connect_timeout_s,
-            cameras=lekiwi_cameras_config(),
+            cameras=cameras,
         )
 
 
@@ -105,6 +115,11 @@ def record(cfg: LeKiwiRecordConfig) -> sLerobotDataset:
 
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
     dataset_features = combine_feature_dicts(robot.observation_features, robot.action_features)
+    if not cfg.robot.use_cameras:
+        logging.info(
+            "Recording without cameras (robot.use_cameras=false). "
+            "Pi host must use: python -m slerobot.robots.lekiwi.lekiwi_host --no-cameras"
+        )
 
     dataset = None
     listener = None
@@ -127,7 +142,7 @@ def record(cfg: LeKiwiRecordConfig) -> sLerobotDataset:
                     num_threads=cfg.dataset.num_image_write_threads_per_camera * len(robot.cameras),
                 )
         else:
-            num_cameras = len(robot.cameras) if hasattr(robot, "cameras") and robot.cameras else 1
+            num_cameras = len(robot.cameras) if hasattr(robot, "cameras") and robot.cameras else 0
             dataset = sLerobotDataset.create(
                 cfg.dataset.repo_id,
                 cfg.dataset.fps,

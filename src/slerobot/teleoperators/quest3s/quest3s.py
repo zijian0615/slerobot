@@ -283,9 +283,27 @@ class Quest3sController(Teleoperator):
             'buttons': {
                 'trigger': payload.get('triggerButton', 0),
                 'grip': payload.get('gripButton', 0),
-            }
+            },
         }
-        #print(f"[Quest3s] PARSED: pos=({result['position']['x']:.1f}, {result['position']['y']:.1f}, {result['position']['z']:.1f})", flush=True)
+        # Thumbsticks / joysticks for mobile base (field names vary by Quest app)
+        for key in (
+            "joystickX",
+            "joystickY",
+            "joystick_x",
+            "joystick_y",
+            "thumbstickX",
+            "thumbstickY",
+            "leftThumbstickX",
+            "leftThumbstickY",
+            "rightThumbstickX",
+            "rightThumbstickY",
+            "axisX",
+            "axisY",
+            "moveX",
+            "moveY",
+        ):
+            if key in payload:
+                result[key] = float(payload[key])
         return result
 
     def __repr__(self):
