@@ -142,6 +142,9 @@ def main(argv: list[str] | None = None) -> None:
             try:
                 msg = host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)
                 data = dict(json.loads(msg))
+                from slerobot.utils.lekiwi_action_debug import log_lekiwi_action_debug
+
+                log_lekiwi_action_debug("pi_zmq_recv", zmq_payload=data)
                 robot.send_action(data)
                 last_cmd_time = time.time()
                 watchdog_active = False

@@ -453,6 +453,7 @@ class LeKiwi(Robot):
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         arm_goal_pos = {k: v for k, v in action.items() if k.endswith(".pos")}
+        arm_goal_raw = dict(arm_goal_pos)
         base_goal_vel = {k: v for k, v in action.items() if k.endswith(".vel")}
 
         base_wheel_goal_vel = self._body_to_wheel_raw(
@@ -464,8 +465,22 @@ class LeKiwi(Robot):
         if self.config.max_relative_target is not None:
             present_pos = self.bus.sync_read("Present_Position", self.arm_motors)
             goal_present_pos = {key: (g_pos, present_pos[key]) for key, g_pos in arm_goal_pos.items()}
-            arm_safe_goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
-            arm_goal_pos = arm_safe_goal_pos
+            arm_goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
+
+        from slerobot.utils.lekiwi_action_debug import log_lekiwi_action_debug
+
+        try:
+            present_pos = self.bus.sync_read("Present_Position", self.arm_motors)
+            present_fmt = {f"{m}.pos": present_pos[m] for m in self.arm_motors}
+            clipped = arm_goal_pos != arm_goal_raw
+            log_lekiwi_action_debug(
+                "pi_send_action",
+                mapped_action=arm_goal_pos,
+                observation=present_fmt,
+                extra="goal vs present (norm)" + ("; safety-clipped" if clipped else ""),
+            )
+        except Exception:
+            log_lekiwi_action_debug("pi_send_action", mapped_action=arm_goal_pos)
 
         # Send goal position to the actuators
         arm_goal_pos_raw = {k.replace(".pos", ""): v for k, v in arm_goal_pos.items()}

@@ -170,6 +170,7 @@ class LeKiwiQuestIK:
         ee_position_scale_mm: float = 0.001,
         max_delta_translation_m: float = 0.08,
         require_trigger: bool = True,
+        settle_frames_after_zero: int = 10,
         use_degrees: bool = False,
         calibration: dict[str, MotorCalibration] | None = None,
     ) -> None:
@@ -182,6 +183,7 @@ class LeKiwiQuestIK:
         self.ee_position_scale_mm = ee_position_scale_mm
         self.max_delta_translation_m = max_delta_translation_m
         self.require_trigger = require_trigger
+        self.settle_frames_after_zero = settle_frames_after_zero
         self.use_degrees = use_degrees
         self.calibration = calibration or {}
 
@@ -189,7 +191,9 @@ class LeKiwiQuestIK:
         self._ref_orientation: tuple[float, float, float] | None = None
         self._prev_a_pressed: bool = False
         self._prev_trigger_pressed: bool = False
-        self._armed: bool = False
+        self._vr_zeroed: bool = False
+        self._zero_pose: tuple[float, float, float, float, float, float] | None = None
+        self._settle_frames: int = 0
         self._logged_waiting_for_enable: bool = False
 
     def reset(self) -> None:
@@ -197,7 +201,9 @@ class LeKiwiQuestIK:
         self._ref_orientation = None
         self._prev_a_pressed = False
         self._prev_trigger_pressed = False
-        self._armed = False
+        self._vr_zeroed = False
+        self._zero_pose = None
+        self._settle_frames = 0
         self._logged_waiting_for_enable = False
 
     def _realign_reference(
@@ -206,7 +212,7 @@ class LeKiwiQuestIK:
         self._ref_position = (px, py, pz)
         self._ref_orientation = (rw, rp, rr)
 
-    def _on_teleop_enable_edge(
+    def _update_button_edges(
         self,
         quest_action: dict[str, Any],
         px: float,
@@ -216,31 +222,42 @@ class LeKiwiQuestIK:
         rp: float,
         rr: float,
     ) -> bool:
-        """A or trigger rising edge: Fanuc VR zero / start teleop (hold joints this frame)."""
+        """A rising only: latch VR zero pose (Fanuc). Returns True to hold arm this frame."""
         a_pressed = quest_a_button_pressed(quest_action)
         a_rising = a_pressed and not self._prev_a_pressed
         self._prev_a_pressed = a_pressed
 
-        trigger = quest_trigger_pressed(quest_action)
-        trigger_rising = trigger and not self._prev_trigger_pressed
-        self._prev_trigger_pressed = trigger
+        self._prev_trigger_pressed = quest_trigger_pressed(quest_action)
 
-        if a_rising or trigger_rising:
-            self._armed = True
+        if a_rising and self.quest_pose_mode == "relative_to_a":
+            self._zero_pose = (px, py, pz, rw, rp, rr)
+            self._vr_zeroed = True
+            self._settle_frames = self.settle_frames_after_zero
             self._logged_waiting_for_enable = False
-            if self.quest_pose_mode == "absolute_pair":
-                self._realign_reference(px, py, pz, rw, rp, rr)
-            which = "A" if a_rising else "trigger"
-            if a_rising and trigger_rising:
-                which = "A+trigger"
             logger.info(
-                "Quest %s — arm teleop armed (mode=%s). Move hand"
-                + (" while holding trigger." if self.require_trigger else "."),
-                which,
-                self.quest_pose_mode,
+                "Quest A — VR zero latched (x=%.1f y=%.1f z=%.1f). "
+                "Hold trigger, then move controller.",
+                px,
+                py,
+                pz,
             )
             return True
+
+        if a_rising and self.quest_pose_mode == "absolute_pair":
+            self._realign_reference(px, py, pz, rw, rp, rr)
+            self._vr_zeroed = True
+            logger.info("Quest A — reference realigned (absolute_pair mode).")
+            return True
+
         return False
+
+    def _quest_offsets_from_zero(
+        self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
+    ) -> tuple[float, float, float, float, float, float]:
+        if self._zero_pose is None:
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        ox, oy, oz, ow, op, or_ = self._zero_pose
+        return px - ox, py - oy, pz - oz, rw - ow, rp - op, rr - or_
 
     def _delta_matrix_from_quest(
         self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
@@ -258,8 +275,9 @@ class LeKiwiQuestIK:
         rr: float,
         current_deg: np.ndarray,
     ) -> np.ndarray:
-        """Quest values are cumulative offset from A-zero (not per-frame); do not clamp total reach."""
-        t_delta = self._delta_matrix_from_quest(px, py, pz, rw, rp, rr)
+        """Offsets relative to pose latched at A-press (handles VR zero delay)."""
+        dx, dy, dz, dw, dp, dr = self._quest_offsets_from_zero(px, py, pz, rw, rp, rr)
+        t_delta = self._delta_matrix_from_quest(dx, dy, dz, dw, dp, dr)
         t_current = self.kinematics.forward_kinematics(current_deg)
         t_target = t_current @ t_delta
         return self.kinematics.inverse_kinematics(
@@ -329,17 +347,20 @@ class LeKiwiQuestIK:
             current_deg, self.calibration, use_degrees=self.use_degrees
         )
 
-        if self._on_teleop_enable_edge(quest_action, px, py, pz, rw, rp, rr):
+        if self._update_button_edges(quest_action, px, py, pz, rw, rp, rr):
             return hold
 
-        if self.quest_pose_mode == "relative_to_a" and not self._armed:
+        if self.quest_pose_mode == "relative_to_a" and not self._vr_zeroed:
             if not self._logged_waiting_for_enable:
                 logger.info(
-                    "Arm teleop idle — press Quest A (zero) or trigger once to start; "
-                    "then move controller%s.",
-                    " while holding trigger" if self.require_trigger else "",
+                    "Arm teleop idle — press Quest A once to set VR zero, "
+                    "then hold trigger and move."
                 )
                 self._logged_waiting_for_enable = True
+            return hold
+
+        if self._settle_frames > 0:
+            self._settle_frames -= 1
             return hold
 
         if self.require_trigger and not quest_trigger_pressed(quest_action):

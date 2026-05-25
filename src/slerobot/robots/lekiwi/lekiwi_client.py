@@ -343,6 +343,10 @@ class LeKiwiClient(Robot):
                 "ManipulatorRobot is not connected. You need to run `robot.connect()`."
             )
 
+        from slerobot.utils.lekiwi_action_debug import log_lekiwi_action_debug
+
+        log_lekiwi_action_debug("mac_zmq_send", zmq_payload=action)
+
         self.zmq_cmd_socket.send_string(json.dumps(action))  # action is in motor space
 
         # TODO(Steven): Remove the np conversion when it is possible to record a non-numpy array value

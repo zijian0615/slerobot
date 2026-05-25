@@ -20,6 +20,10 @@ python -m slerobot.scripts.slerobot_lekiwi_record \
 #   -> .../robots/lekiwi_client/lekiwi_client.json
 # With cameras on both sides:
 #   add --robot.use_cameras=true
+#
+# Debug send_action (Mac + Pi):
+#   export SLEROBOT_DEBUG_ACTION=1
+#   export SLEROBOT_DEBUG_ACTION_HZ=5   # optional, max prints per second
 ```
 """
 

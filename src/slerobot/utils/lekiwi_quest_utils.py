@@ -29,6 +29,7 @@ class LeKiwiQuestMapperConfig:
     orientation_weight: float = 0.05
     max_delta_translation_m: float = 0.12
     require_trigger: bool = True
+    settle_frames_after_zero: int = 10
     gripper_open: float = 0.0
     gripper_closed: float = 100.0
     joystick_xy_speed: float = 0.15
@@ -147,6 +148,7 @@ class LeKiwiQuestMapper:
                 orientation_weight=self.config.orientation_weight,
                 max_delta_translation_m=self.config.max_delta_translation_m,
                 require_trigger=self.config.require_trigger,
+                settle_frames_after_zero=self.config.settle_frames_after_zero,
                 quest_position_scale=self.config.quest_position_scale,
                 ee_position_scale_mm=self.config.ee_position_scale_mm,
                 use_degrees=self.config.use_degrees,

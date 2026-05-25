@@ -33,6 +33,7 @@ from slerobot.policies.act.modeling_act import ACTEigenCAMHelper, ACTPolicy, att
 from slerobot.policies.factory import get_policy_class, make_pre_post_processors
 
 from slerobot.utils.control_utils import init_keyboard_listener, is_headless, predict_action
+from slerobot.utils.lekiwi_action_debug import log_lekiwi_action_debug
 from slerobot.utils.robot_utils import decode_fanuc_pose_dict, encode_fanuc_pose_dict
 from slerobot.utils.utils import get_safe_torch_device, init_logging, log_say
 from slerobot.utils.live_telemetry import push_live_telemetry
@@ -530,6 +531,12 @@ def record_loop(
             )
             act = quest_mapper.map_action(quest_act, obs, base_action=base_action or None)
             act_processed_teleop = teleop_action_processor((act, obs))
+            log_lekiwi_action_debug(
+                "mac_after_mapper",
+                quest_action=quest_act,
+                observation=obs,
+                mapped_action=act_processed_teleop,
+            )
         elif policy is None and isinstance(teleop, list):
             teleop_arm, teleop_keyboard = teleop
             arm_action = teleop_arm.get_action()
@@ -592,6 +599,13 @@ def record_loop(
             action_values = dict(act_processed_teleop or {})
             encoded_action_values = action_values
             robot_action_to_send = robot_action_processor((action_values, obs))
+
+        if robot_backend == "lekiwi":
+            log_lekiwi_action_debug(
+                "mac_before_send_action",
+                mapped_action=robot_action_to_send,
+                observation=obs,
+            )
 
         robot.send_action(robot_action_to_send)
 
