@@ -283,6 +283,16 @@ class Quest3sController(Teleoperator):
             'buttons': {
                 'trigger': payload.get('triggerButton', 0),
                 'grip': payload.get('gripButton', 0),
+                # Meta Quest A / primary button (field names vary by MQTT publisher)
+                'a': int(
+                    payload.get(
+                        'aButton',
+                        payload.get(
+                            'buttonA',
+                            payload.get('primaryButton', payload.get('A', payload.get('button_a', 0))),
+                        ),
+                    )
+                ),
             },
         }
         # Thumbsticks / joysticks for mobile base (field names vary by Quest app)

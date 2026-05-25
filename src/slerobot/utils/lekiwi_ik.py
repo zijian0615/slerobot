@@ -130,6 +130,17 @@ def joint_degrees_to_arm_action(
     return action
 
 
+def quest_a_button_pressed(quest_action: dict[str, Any]) -> bool:
+    """True if Quest A / primary button is held (MQTT field names differ by app)."""
+    buttons = quest_action.get("buttons", {})
+    if int(buttons.get("a", 0)):
+        return True
+    for key in ("aButton", "buttonA", "primaryButton", "A", "button_a"):
+        if int(quest_action.get(key, 0)):
+            return True
+    return False
+
+
 class LeKiwiQuestIK:
     """Relative Quest EE deltas applied on the robot FK pose, then solved with IK."""
 
@@ -141,6 +152,7 @@ class LeKiwiQuestIK:
         orientation_weight: float = 0.05,
         quest_position_scale: float = 1.0,
         ee_position_scale_mm: float = 0.001,
+        max_delta_translation_m: float = 0.12,
         use_degrees: bool = False,
         calibration: dict[str, MotorCalibration] | None = None,
     ) -> None:
@@ -150,15 +162,44 @@ class LeKiwiQuestIK:
         self.orientation_weight = orientation_weight
         self.quest_position_scale = quest_position_scale
         self.ee_position_scale_mm = ee_position_scale_mm
+        self.max_delta_translation_m = max_delta_translation_m
         self.use_degrees = use_degrees
         self.calibration = calibration or {}
 
         self._ref_position: tuple[float, float, float] | None = None
         self._ref_orientation: tuple[float, float, float] | None = None
+        self._prev_a_pressed: bool = False
 
     def reset(self) -> None:
         self._ref_position = None
         self._ref_orientation = None
+        self._prev_a_pressed = False
+
+    def _realign_reference(
+        self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
+    ) -> None:
+        self._ref_position = (px, py, pz)
+        self._ref_orientation = (rw, rp, rr)
+
+    def _handle_a_button(
+        self,
+        quest_action: dict[str, Any],
+        px: float,
+        py: float,
+        pz: float,
+        rw: float,
+        rp: float,
+        rr: float,
+    ) -> bool:
+        """On A-button rising edge, realign Quest reference (typical 'start teleop' gesture)."""
+        pressed = quest_a_button_pressed(quest_action)
+        rising = pressed and not self._prev_a_pressed
+        self._prev_a_pressed = pressed
+        if rising:
+            self._realign_reference(px, py, pz, rw, rp, rr)
+            logger.info("Quest A pressed — IK reference realigned to current controller pose.")
+            return True
+        return False
 
     def solve(
         self,
@@ -178,9 +219,13 @@ class LeKiwiQuestIK:
             observation, self.calibration, use_degrees=self.use_degrees
         )
 
+        if self._handle_a_button(quest_action, px, py, pz, rw, rp, rr):
+            return joint_degrees_to_arm_action(
+                current_deg, self.calibration, use_degrees=self.use_degrees
+            )
+
         if self._ref_position is None:
-            self._ref_position = (px, py, pz)
-            self._ref_orientation = (rw, rp, rr)
+            self._realign_reference(px, py, pz, rw, rp, rr)
             return joint_degrees_to_arm_action(
                 current_deg, self.calibration, use_degrees=self.use_degrees
             )
@@ -192,6 +237,18 @@ class LeKiwiQuestIK:
         t_ref = fanuc_pose_to_matrix(ref_x, ref_y, ref_z, ref_w, ref_p, ref_r, position_scale=scale)
         t_now = fanuc_pose_to_matrix(px, py, pz, rw, rp, rr, position_scale=scale)
         t_delta = t_now @ np.linalg.inv(t_ref)
+
+        delta_m = float(np.linalg.norm(t_delta[:3, 3]))
+        if delta_m > self.max_delta_translation_m:
+            logger.warning(
+                "Quest pose jump %.3f m > %.3f m — realigning IK reference (check A-button / MQTT units).",
+                delta_m,
+                self.max_delta_translation_m,
+            )
+            self._realign_reference(px, py, pz, rw, rp, rr)
+            return joint_degrees_to_arm_action(
+                current_deg, self.calibration, use_degrees=self.use_degrees
+            )
 
         t_current = self.kinematics.forward_kinematics(current_deg)
         t_target = t_current @ t_delta

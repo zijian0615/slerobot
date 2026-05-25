@@ -39,7 +39,6 @@ from slerobot.processor import make_default_processors
 from slerobot.robots.lekiwi.config_lekiwi import LeKiwiClientConfig, lekiwi_cameras_config
 from slerobot.robots.lekiwi.lekiwi_client import LeKiwiClient
 from slerobot.scripts.slerobot_record import (
-    DatasetRecordConfig,
     Quest3sConfig,
     record_loop,
 )
@@ -53,6 +52,30 @@ from slerobot.utils.visualization_utils import _init_rerun, shutdown_rerun
 
 def _ui_telemetry_enabled() -> bool:
     return os.getenv("SLEROBOT_TELEMETRY_PUSH", "").lower() in ("1", "true", "yes")
+
+
+@dataclass
+class LeKiwiDatasetRecordConfig:
+    """Dataset settings for LeKiwi Quest recording (`single_task` has a default)."""
+
+    repo_id: str
+    single_task: str = "pick and place"
+    root: str | None = None
+    fps: int = 20
+    episode_time_s: int | float = 60
+    reset_time_s: int | float = 60
+    num_episodes: int = 50
+    video: bool = False
+    push_to_hub: bool = False
+    private: bool = False
+    tags: list[str] | None = None
+    num_image_writer_process: int = 0
+    num_image_write_threads_per_camera: int = 4
+    video_encoding_batch_size: int = 1
+    vcodec: str = "libsvtav1"
+    streaming_encoding: bool = False
+    encoder_queue_maxsize: int = 30
+    encoder_threads: int = 2
 
 
 @dataclass
@@ -83,7 +106,7 @@ class LeKiwiRobotRecordConfig:
 
 @dataclass
 class LeKiwiRecordConfig:
-    dataset: DatasetRecordConfig
+    dataset: LeKiwiDatasetRecordConfig
     robot: LeKiwiRobotRecordConfig = field(default_factory=LeKiwiRobotRecordConfig)
     teleop: Quest3sConfig = field(default_factory=Quest3sConfig)
     display_data: bool = False
