@@ -141,6 +141,13 @@ def quest_a_button_pressed(quest_action: dict[str, Any]) -> bool:
     return False
 
 
+def quest_trigger_pressed(quest_action: dict[str, Any]) -> bool:
+    buttons = quest_action.get("buttons", {})
+    if int(buttons.get("trigger", 0)):
+        return True
+    return bool(int(quest_action.get("triggerButton", 0)))
+
+
 QuestPoseMode = Literal["relative_to_a", "absolute_pair"]
 
 
@@ -162,6 +169,7 @@ class LeKiwiQuestIK:
         quest_position_scale: float = 0.5,
         ee_position_scale_mm: float = 0.001,
         max_delta_translation_m: float = 0.08,
+        require_trigger: bool = True,
         use_degrees: bool = False,
         calibration: dict[str, MotorCalibration] | None = None,
     ) -> None:
@@ -173,19 +181,24 @@ class LeKiwiQuestIK:
         self.quest_position_scale = quest_position_scale
         self.ee_position_scale_mm = ee_position_scale_mm
         self.max_delta_translation_m = max_delta_translation_m
+        self.require_trigger = require_trigger
         self.use_degrees = use_degrees
         self.calibration = calibration or {}
 
         self._ref_position: tuple[float, float, float] | None = None
         self._ref_orientation: tuple[float, float, float] | None = None
         self._prev_a_pressed: bool = False
+        self._prev_trigger_pressed: bool = False
         self._armed: bool = False
+        self._logged_waiting_for_enable: bool = False
 
     def reset(self) -> None:
         self._ref_position = None
         self._ref_orientation = None
         self._prev_a_pressed = False
+        self._prev_trigger_pressed = False
         self._armed = False
+        self._logged_waiting_for_enable = False
 
     def _realign_reference(
         self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
@@ -193,7 +206,7 @@ class LeKiwiQuestIK:
         self._ref_position = (px, py, pz)
         self._ref_orientation = (rw, rp, rr)
 
-    def _on_a_button_edge(
+    def _on_teleop_enable_edge(
         self,
         quest_action: dict[str, Any],
         px: float,
@@ -203,16 +216,27 @@ class LeKiwiQuestIK:
         rp: float,
         rr: float,
     ) -> bool:
-        """A-button rising edge: Fanuc-style VR zero (arm teleop armed, no motion this frame)."""
-        pressed = quest_a_button_pressed(quest_action)
-        rising = pressed and not self._prev_a_pressed
-        self._prev_a_pressed = pressed
-        if rising:
+        """A or trigger rising edge: Fanuc VR zero / start teleop (hold joints this frame)."""
+        a_pressed = quest_a_button_pressed(quest_action)
+        a_rising = a_pressed and not self._prev_a_pressed
+        self._prev_a_pressed = a_pressed
+
+        trigger = quest_trigger_pressed(quest_action)
+        trigger_rising = trigger and not self._prev_trigger_pressed
+        self._prev_trigger_pressed = trigger
+
+        if a_rising or trigger_rising:
             self._armed = True
+            self._logged_waiting_for_enable = False
             if self.quest_pose_mode == "absolute_pair":
                 self._realign_reference(px, py, pz, rw, rp, rr)
+            which = "A" if a_rising else "trigger"
+            if a_rising and trigger_rising:
+                which = "A+trigger"
             logger.info(
-                "Quest A pressed — arm teleop armed (mode=%s, VR offsets from zero).",
+                "Quest %s — arm teleop armed (mode=%s). Move hand"
+                + (" while holding trigger." if self.require_trigger else "."),
+                which,
                 self.quest_pose_mode,
             )
             return True
@@ -234,18 +258,8 @@ class LeKiwiQuestIK:
         rr: float,
         current_deg: np.ndarray,
     ) -> np.ndarray:
-        """Quest values are already offset from A-zero; apply once on robot FK."""
+        """Quest values are cumulative offset from A-zero (not per-frame); do not clamp total reach."""
         t_delta = self._delta_matrix_from_quest(px, py, pz, rw, rp, rr)
-        delta_m = float(np.linalg.norm(t_delta[:3, 3]))
-        if delta_m > self.max_delta_translation_m:
-            logger.warning(
-                "Quest offset %.3f m exceeds cap %.3f m — clamping (check mm vs m units).",
-                delta_m,
-                self.max_delta_translation_m,
-            )
-            if delta_m > 1e-9:
-                t_delta[:3, 3] *= self.max_delta_translation_m / delta_m
-
         t_current = self.kinematics.forward_kinematics(current_deg)
         t_target = t_current @ t_delta
         return self.kinematics.inverse_kinematics(
@@ -315,10 +329,20 @@ class LeKiwiQuestIK:
             current_deg, self.calibration, use_degrees=self.use_degrees
         )
 
-        if self._on_a_button_edge(quest_action, px, py, pz, rw, rp, rr):
+        if self._on_teleop_enable_edge(quest_action, px, py, pz, rw, rp, rr):
             return hold
 
         if self.quest_pose_mode == "relative_to_a" and not self._armed:
+            if not self._logged_waiting_for_enable:
+                logger.info(
+                    "Arm teleop idle — press Quest A (zero) or trigger once to start; "
+                    "then move controller%s.",
+                    " while holding trigger" if self.require_trigger else "",
+                )
+                self._logged_waiting_for_enable = True
+            return hold
+
+        if self.require_trigger and not quest_trigger_pressed(quest_action):
             return hold
 
         try:
