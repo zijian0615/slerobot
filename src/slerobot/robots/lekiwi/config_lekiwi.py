@@ -41,7 +41,7 @@ def lekiwi_cameras_config() -> dict[str, CameraConfig]:
 
 
 @RobotConfig.register_subclass("lekiwi")
-@dataclass
+@dataclass(kw_only=True)
 class LeKiwiConfig(RobotConfig):
     port: str = "/dev/ttyACM0"  # port to connect to the bus
 
@@ -78,10 +78,10 @@ class LeKiwiHostConfig:
 
 
 @RobotConfig.register_subclass("lekiwi_client")
-@dataclass
+@dataclass(kw_only=True)
 class LeKiwiClientConfig(RobotConfig):
     # Network Configuration
-    remote_ip: str
+    remote_ip: str = ""
     port_zmq_cmd: int = 5555
     port_zmq_observations: int = 5556
 

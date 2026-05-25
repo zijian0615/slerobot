@@ -3,11 +3,11 @@ Record LeKiwi demonstrations with Quest 3s (arm) + keyboard (base).
 
 Example:
 ```shell
-python -m slerobot.scripts.slerobot_lekiwi_record \\
-    --dataset.repo_id=user/lekiwi_quest \\
-    --dataset.single_task="pick and place" \\
-    --robot.remote_ip=192.168.1.10 \\
-    --teleop.mqtt_broker=10.22.9.10 \\
+python -m slerobot.scripts.slerobot_lekiwi_record \
+    --dataset.repo_id=user/lekiwi_quest \
+    --dataset.single_task="pick and place" \
+    --robot.remote_ip=10.22.26.30  \
+    --teleop.mqtt_broker=10.22.9.10 \
     --teleop.mqtt_topic=quest/data
 ```
 """
@@ -25,7 +25,7 @@ from slerobot.datasets.slerobot_datasets import sLerobotDataset
 from slerobot.datasets.utils import combine_feature_dicts
 from slerobot.datasets.video_utils import VideoEncodingManager
 from slerobot.processor import make_default_processors
-from slerobot.robots.lekiwi.config_lekiwi import LeKiwiClientConfig
+from slerobot.robots.lekiwi.config_lekiwi import LeKiwiClientConfig, lekiwi_cameras_config
 from slerobot.robots.lekiwi.lekiwi_client import LeKiwiClient
 from slerobot.scripts.slerobot_record import (
     DatasetRecordConfig,
@@ -45,9 +45,32 @@ def _ui_telemetry_enabled() -> bool:
 
 
 @dataclass
+class LeKiwiRobotRecordConfig:
+    """Plain dataclass for draccus CLI (same pattern as FanucConfig in slerobot_record)."""
+
+    remote_ip: str = "127.0.0.1"
+    port_zmq_cmd: int = 5555
+    port_zmq_observations: int = 5556
+    polling_timeout_ms: int = 15
+    connect_timeout_s: int = 5
+    id: str = "lekiwi_client"
+
+    def to_client_config(self) -> LeKiwiClientConfig:
+        return LeKiwiClientConfig(
+            id=self.id,
+            remote_ip=self.remote_ip,
+            port_zmq_cmd=self.port_zmq_cmd,
+            port_zmq_observations=self.port_zmq_observations,
+            polling_timeout_ms=self.polling_timeout_ms,
+            connect_timeout_s=self.connect_timeout_s,
+            cameras=lekiwi_cameras_config(),
+        )
+
+
+@dataclass
 class LeKiwiRecordConfig:
     dataset: DatasetRecordConfig
-    robot: LeKiwiClientConfig
+    robot: LeKiwiRobotRecordConfig = field(default_factory=LeKiwiRobotRecordConfig)
     teleop: Quest3sConfig = field(default_factory=Quest3sConfig)
     display_data: bool = False
     display_ip: str | None = None
@@ -66,13 +89,17 @@ class LeKiwiRecordConfig:
 def record(cfg: LeKiwiRecordConfig) -> sLerobotDataset:
     init_logging()
 
-    robot = LeKiwiClient(cfg.robot)
+    client_cfg = cfg.robot.to_client_config()
+    if not client_cfg.remote_ip:
+        raise ValueError("Set the Pi host IP: --robot.remote_ip=10.22.26.30")
+
+    robot = LeKiwiClient(client_cfg)
     teleop_quest = Quest3sController(
         mqtt_broker=cfg.teleop.mqtt_broker,
         mqtt_port=cfg.teleop.mqtt_port,
         mqtt_topic=cfg.teleop.mqtt_topic,
     )
-    teleop_keyboard = LeKiwiKeyboardTeleop(teleop_keys=cfg.robot.teleop_keys)
+    teleop_keyboard = LeKiwiKeyboardTeleop(teleop_keys=client_cfg.teleop_keys)
     teleop = [teleop_quest, teleop_keyboard]
     quest_mapper = LeKiwiQuestMapper()
 
