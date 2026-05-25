@@ -172,10 +172,13 @@ class LeKiwiQuestIK:
         require_trigger: bool = True,
         settle_frames_after_zero: int = 20,
         warmup_frames_after_settle: int = 10,
-        ramp_frames: int = 25,
-        max_joint_step_deg: float = 5.0,
+        ramp_frames: int = 0,
+        max_joint_step_deg: float = 3.0,
         position_deadzone_mm: float = 3.0,
         rotation_deadzone_deg: float = 2.0,
+        increment_deadzone_mm: float = 0.8,
+        increment_deadzone_deg: float = 0.5,
+        quest_delta_ema_alpha: float = 0.35,
         resync_zero_during_settle: bool = True,
         use_degrees: bool = False,
         calibration: dict[str, MotorCalibration] | None = None,
@@ -195,6 +198,9 @@ class LeKiwiQuestIK:
         self.max_joint_step_deg = max_joint_step_deg
         self.position_deadzone_mm = position_deadzone_mm
         self.rotation_deadzone_deg = rotation_deadzone_deg
+        self.increment_deadzone_mm = increment_deadzone_mm
+        self.increment_deadzone_deg = increment_deadzone_deg
+        self.quest_delta_ema_alpha = quest_delta_ema_alpha
         self.resync_zero_during_settle = resync_zero_during_settle
         self.use_degrees = use_degrees
         self.calibration = calibration or {}
@@ -205,7 +211,8 @@ class LeKiwiQuestIK:
         self._prev_trigger_pressed: bool = False
         self._vr_zeroed: bool = False
         self._zero_pose: tuple[float, float, float, float, float, float] | None = None
-        self._neutral_fk: np.ndarray | None = None
+        self._filtered_delta: tuple[float, float, float, float, float, float] | None = None
+        self._last_target_deg: np.ndarray | None = None
         self._settle_frames: int = 0
         self._warmup_frames: int = 0
         self._ramp_frames_remaining: int = 0
@@ -219,7 +226,8 @@ class LeKiwiQuestIK:
         self._prev_trigger_pressed = False
         self._vr_zeroed = False
         self._zero_pose = None
-        self._neutral_fk = None
+        self._filtered_delta = None
+        self._last_target_deg = None
         self._settle_frames = 0
         self._warmup_frames = 0
         self._ramp_frames_remaining = 0
@@ -236,7 +244,8 @@ class LeKiwiQuestIK:
         self, px: float, py: float, pz: float, rw: float, rp: float, rr: float, *, source: str
     ) -> None:
         self._zero_pose = (px, py, pz, rw, rp, rr)
-        self._neutral_fk = None
+        self._filtered_delta = None
+        self._last_target_deg = None
         self._vr_zeroed = True
         self._settle_frames = self.settle_frames_after_zero
         self._warmup_frames = 0
@@ -307,7 +316,8 @@ class LeKiwiQuestIK:
         if trigger_falling and self.quest_pose_mode == "relative_to_a" and self._vr_zeroed:
             self._vr_zeroed = False
             self._zero_pose = None
-            self._neutral_fk = None
+            self._filtered_delta = None
+            self._last_target_deg = None
             self._settle_frames = 0
             self._warmup_frames = 0
             self._ramp_frames_remaining = 0
@@ -362,6 +372,39 @@ class LeKiwiQuestIK:
             return self._quest_offsets_from_zero(px, py, pz, rw, rp, rr)
         return px, py, pz, rw, rp, rr
 
+    def _reset_delta_tracking(
+        self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
+    ) -> None:
+        self._filtered_delta = self._quest_delta_for_ik(px, py, pz, rw, rp, rr)
+
+    def _quest_increment_for_ik(
+        self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
+    ) -> tuple[float, float, float, float, float, float]:
+        """Per-frame change in (smoothed) quest delta — still when offset constant, no crawl."""
+        raw = self._quest_delta_for_ik(px, py, pz, rw, rp, rr)
+        if self._filtered_delta is None:
+            self._filtered_delta = raw
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        a = float(self.quest_delta_ema_alpha)
+        prev = self._filtered_delta
+        smoothed = tuple(a * r + (1.0 - a) * p for r, p in zip(raw, prev))
+        inc = tuple(s - p for s, p in zip(smoothed, prev))
+        self._filtered_delta = smoothed
+        return inc
+
+    def _increment_below_deadzone(
+        self,
+        dx: float,
+        dy: float,
+        dz: float,
+        dw: float,
+        dp: float,
+        dr: float,
+    ) -> bool:
+        pos = max(abs(dx), abs(dy), abs(dz))
+        rot = max(abs(dw), abs(dp), abs(dr))
+        return pos < self.increment_deadzone_mm and rot < self.increment_deadzone_deg
+
     def _pose_delta_below_deadzone(
         self,
         dx: float,
@@ -385,24 +428,24 @@ class LeKiwiQuestIK:
         rr: float,
         current_deg: np.ndarray,
     ) -> np.ndarray:
-        motion_scale = self._motion_scale_multiplier()
-        dx, dy, dz, dw, dp, dr = self._quest_delta_for_ik(px, py, pz, rw, rp, rr)
-        t_delta = self._delta_matrix_from_quest(
-            dx, dy, dz, dw, dp, dr, motion_scale=motion_scale
-        )
-        if self._neutral_fk is not None:
-            # Target fixed in space from neutral lock — constant delta does not crawl frame-by-frame.
-            t_target = self._neutral_fk @ t_delta
-        else:
-            t_current = self.kinematics.forward_kinematics(current_deg)
-            t_target = t_current @ t_delta
+        dx, dy, dz, dw, dp, dr = self._quest_increment_for_ik(px, py, pz, rw, rp, rr)
+        if self._increment_below_deadzone(dx, dy, dz, dw, dp, dr):
+            if self._last_target_deg is not None:
+                return self._last_target_deg.copy()
+            return current_deg
+
+        t_delta = self._delta_matrix_from_quest(dx, dy, dz, dw, dp, dr, motion_scale=1.0)
+        t_current = self.kinematics.forward_kinematics(current_deg)
+        t_target = t_current @ t_delta
         target_deg = self.kinematics.inverse_kinematics(
             current_deg,
             t_target,
             position_weight=self.position_weight,
             orientation_weight=self.orientation_weight,
         )
-        return self._clamp_joint_deg_step(current_deg, target_deg)
+        target_deg = self._clamp_joint_deg_step(current_deg, target_deg)
+        self._last_target_deg = target_deg.copy()
+        return target_deg
 
     def _solve_absolute_pair(
         self,
@@ -490,7 +533,8 @@ class LeKiwiQuestIK:
             self._warmup_frames -= 1
             if self._warmup_frames == 0:
                 self._ramp_frames_remaining = self.ramp_frames
-                self._neutral_fk = self.kinematics.forward_kinematics(current_deg)
+                self._reset_delta_tracking(px, py, pz, rw, rp, rr)
+                self._last_target_deg = current_deg.copy()
                 self._logged_near_zero_offset = False
                 logger.info(
                     "Teleop neutral locked (x=%.1f y=%.1f z=%.1f) — move hand only after this.",
@@ -505,6 +549,10 @@ class LeKiwiQuestIK:
 
         dx, dy, dz, dw, dp, dr = self._quest_delta_for_ik(px, py, pz, rw, rp, rr)
         if self._pose_delta_below_deadzone(dx, dy, dz, dw, dp, dr):
+            if self._last_target_deg is not None:
+                return joint_degrees_to_arm_action(
+                    self._last_target_deg, self.calibration, use_degrees=self.use_degrees
+                )
             if (
                 not self._logged_near_zero_offset
                 and quest_trigger_pressed(quest_action)

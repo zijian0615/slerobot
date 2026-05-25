@@ -31,10 +31,13 @@ class LeKiwiQuestMapperConfig:
     require_trigger: bool = True
     settle_frames_after_zero: int = 20
     warmup_frames_after_settle: int = 10
-    ramp_frames: int = 25
-    max_joint_step_deg: float = 5.0
+    ramp_frames: int = 0
+    max_joint_step_deg: float = 3.0
     position_deadzone_mm: float = 3.0
     rotation_deadzone_deg: float = 2.0
+    increment_deadzone_mm: float = 0.8
+    increment_deadzone_deg: float = 0.5
+    quest_delta_ema_alpha: float = 0.35
     resync_zero_during_settle: bool = True
     gripper_open: float = 0.0
     gripper_closed: float = 100.0
@@ -160,6 +163,9 @@ class LeKiwiQuestMapper:
                 max_joint_step_deg=self.config.max_joint_step_deg,
                 position_deadzone_mm=self.config.position_deadzone_mm,
                 rotation_deadzone_deg=self.config.rotation_deadzone_deg,
+                increment_deadzone_mm=self.config.increment_deadzone_mm,
+                increment_deadzone_deg=self.config.increment_deadzone_deg,
+                quest_delta_ema_alpha=self.config.quest_delta_ema_alpha,
                 resync_zero_during_settle=self.config.resync_zero_during_settle,
                 quest_position_scale=self.config.quest_position_scale,
                 ee_position_scale_mm=self.config.ee_position_scale_mm,
