@@ -36,6 +36,7 @@ class LeKiwiQuestMapperConfig:
     position_deadzone_mm: float = 1.5
     rotation_deadzone_deg: float = 1.5
     quest_delta_ema_alpha: float = 0.55
+    joint_output_alpha: float = 0.4
     resync_zero_during_settle: bool = True
     gripper_open: float = 0.0
     gripper_closed: float = 100.0
@@ -162,6 +163,7 @@ class LeKiwiQuestMapper:
                 position_deadzone_mm=self.config.position_deadzone_mm,
                 rotation_deadzone_deg=self.config.rotation_deadzone_deg,
                 quest_delta_ema_alpha=self.config.quest_delta_ema_alpha,
+                joint_output_alpha=self.config.joint_output_alpha,
                 resync_zero_during_settle=self.config.resync_zero_during_settle,
                 quest_position_scale=self.config.quest_position_scale,
                 ee_position_scale_mm=self.config.ee_position_scale_mm,

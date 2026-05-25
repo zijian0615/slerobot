@@ -177,6 +177,7 @@ class LeKiwiQuestIK:
         position_deadzone_mm: float = 1.5,
         rotation_deadzone_deg: float = 1.5,
         quest_delta_ema_alpha: float = 0.55,
+        joint_output_alpha: float = 0.4,
         resync_zero_during_settle: bool = True,
         use_degrees: bool = False,
         calibration: dict[str, MotorCalibration] | None = None,
@@ -197,6 +198,7 @@ class LeKiwiQuestIK:
         self.position_deadzone_mm = position_deadzone_mm
         self.rotation_deadzone_deg = rotation_deadzone_deg
         self.quest_delta_ema_alpha = quest_delta_ema_alpha
+        self.joint_output_alpha = joint_output_alpha
         self.resync_zero_during_settle = resync_zero_during_settle
         self.use_degrees = use_degrees
         self.calibration = calibration or {}
@@ -284,16 +286,31 @@ class LeKiwiQuestIK:
         return out
 
     def _clamp_joint_deg_step(
-        self, current_deg: np.ndarray, target_deg: np.ndarray
+        self, base_deg: np.ndarray, target_deg: np.ndarray
     ) -> np.ndarray:
         step = float(self.max_joint_step_deg)
         if step <= 0:
             return target_deg
-        delta = target_deg - current_deg
+        delta = target_deg - base_deg
         max_abs = float(np.max(np.abs(delta)))
         if max_abs <= step:
             return target_deg
-        return current_deg + delta * (step / max_abs)
+        return base_deg + delta * (step / max_abs)
+
+    def _smooth_joint_target(
+        self, raw_target_deg: np.ndarray, current_deg: np.ndarray
+    ) -> np.ndarray:
+        """Limit step from last command (not noisy obs), then EMA — reduces pan jitter."""
+        base = (
+            self._last_target_deg
+            if self._last_target_deg is not None
+            else current_deg
+        )
+        stepped = self._clamp_joint_deg_step(base, raw_target_deg)
+        if self._last_target_deg is None:
+            return stepped
+        a = float(self.joint_output_alpha)
+        return a * stepped + (1.0 - a) * self._last_target_deg
 
     def _update_button_edges(
         self,
@@ -431,18 +448,19 @@ class LeKiwiQuestIK:
             t_current = self.kinematics.forward_kinematics(current_deg)
             t_target = t_current @ t_delta
 
-        ik_seed = (
-            self._neutral_joint_deg
-            if self._neutral_joint_deg is not None
-            else current_deg
-        )
-        target_deg = self.kinematics.inverse_kinematics(
+        if self._last_target_deg is not None:
+            ik_seed = self._last_target_deg
+        elif self._neutral_joint_deg is not None:
+            ik_seed = self._neutral_joint_deg
+        else:
+            ik_seed = current_deg
+        raw_target = self.kinematics.inverse_kinematics(
             ik_seed,
             t_target,
             position_weight=self.position_weight,
             orientation_weight=self.orientation_weight,
         )
-        target_deg = self._clamp_joint_deg_step(current_deg, target_deg)
+        target_deg = self._smooth_joint_target(raw_target, current_deg)
         self._last_target_deg = target_deg.copy()
         return target_deg
 
@@ -483,7 +501,7 @@ class LeKiwiQuestIK:
             position_weight=self.position_weight,
             orientation_weight=self.orientation_weight,
         )
-        return self._clamp_joint_deg_step(current_deg, target_deg)
+        return self._smooth_joint_target(target_deg, current_deg)
 
     def solve(
         self,

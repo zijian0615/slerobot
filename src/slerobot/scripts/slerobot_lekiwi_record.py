@@ -122,6 +122,7 @@ class LeKiwiQuestMapConfig:
     orientation_weight: float = 0.05
     max_joint_step_deg: float = 5.0
     quest_delta_ema_alpha: float = 0.55
+    joint_output_alpha: float = 0.4
     position_deadzone_mm: float = 1.5
     rotation_deadzone_deg: float = 1.5
 
@@ -167,18 +168,19 @@ def record(cfg: LeKiwiRecordConfig) -> sLerobotDataset:
             orientation_weight=cfg.quest_map.orientation_weight,
             max_joint_step_deg=cfg.quest_map.max_joint_step_deg,
             quest_delta_ema_alpha=cfg.quest_map.quest_delta_ema_alpha,
+            joint_output_alpha=cfg.quest_map.joint_output_alpha,
             position_deadzone_mm=cfg.quest_map.position_deadzone_mm,
             rotation_deadzone_deg=cfg.quest_map.rotation_deadzone_deg,
         )
     )
     logging.info(
         "Quest arm sensitivity: position_scale=%.3f orientation_weight=%.3f "
-        "max_joint_step_deg=%.1f ema_alpha=%.2f deadzone_mm=%.1f",
+        "max_joint_step_deg=%.1f quest_ema=%.2f joint_ema=%.2f (use max_joint_step<=4 if jitter)",
         cfg.quest_map.position_scale,
         cfg.quest_map.orientation_weight,
         cfg.quest_map.max_joint_step_deg,
         cfg.quest_map.quest_delta_ema_alpha,
-        cfg.quest_map.position_deadzone_mm,
+        cfg.quest_map.joint_output_alpha,
     )
 
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
