@@ -1,8 +1,15 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Tuple, Optional
+import json
 import logging
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+from slerobot.motors import MotorCalibration
+from slerobot.utils.constants import HF_LEROBOT_CALIBRATION
 
 logger = logging.getLogger(__name__)
+
+ROBOTS = "robots"
 
 
 class Robot(ABC):
@@ -16,6 +23,48 @@ class Robot(ABC):
     - Communication: send_action, get_observation
     - Status: is_connected
     """
+
+    config_class: type | None = None
+    name: str = ""
+
+    def __init__(self, config: Any | None = None) -> None:
+        if config is None:
+            return
+        self.config = config
+        self.robot_type = getattr(self, "name", "")
+        self.id = getattr(config, "id", "") or self.robot_type or "default"
+        calibration_dir = getattr(config, "calibration_dir", None)
+        self.calibration_dir = (
+            Path(calibration_dir)
+            if calibration_dir is not None
+            else HF_LEROBOT_CALIBRATION / ROBOTS / self.name
+        )
+        self.calibration_dir.mkdir(parents=True, exist_ok=True)
+        self.calibration_fpath = self.calibration_dir / f"{self.id}.json"
+        self.calibration: dict[str, MotorCalibration] = {}
+        if self.calibration_fpath.is_file():
+            self._load_calibration()
+
+    def _load_calibration(self) -> None:
+        with open(self.calibration_fpath, encoding="utf-8") as f:
+            data = json.load(f)
+        self.calibration = {
+            name: MotorCalibration(**values) for name, values in data.items()
+        }
+
+    def _save_calibration(self) -> None:
+        data = {
+            name: {
+                "id": cal.id,
+                "drive_mode": cal.drive_mode,
+                "homing_offset": cal.homing_offset,
+                "range_min": cal.range_min,
+                "range_max": cal.range_max,
+            }
+            for name, cal in self.calibration.items()
+        }
+        with open(self.calibration_fpath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
 
     @abstractmethod
     def connect(self) -> None:

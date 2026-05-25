@@ -21,12 +21,21 @@ from ..config import RobotConfig
 
 
 def lekiwi_cameras_config() -> dict[str, CameraConfig]:
+    """Use native camera resolution (width/height=None) — many USB cams on Pi cannot force 640x480."""
     return {
         "front": OpenCVCameraConfig(
-            index_or_path="/dev/video0", fps=30, width=640, height=480, rotation=Cv2Rotation.ROTATE_180
+            index_or_path="/dev/video0",
+            fps=30,
+            width=None,
+            height=None,
+            rotation=Cv2Rotation.ROTATE_180,
         ),
         "wrist": OpenCVCameraConfig(
-            index_or_path="/dev/video2", fps=30, width=480, height=640, rotation=Cv2Rotation.ROTATE_90
+            index_or_path="/dev/video2",
+            fps=30,
+            width=None,
+            height=None,
+            rotation=Cv2Rotation.ROTATE_90,
         ),
     }
 
@@ -55,14 +64,17 @@ class LeKiwiHostConfig:
     port_zmq_cmd: int = 5555
     port_zmq_observations: int = 5556
 
-    # Duration of the application
-    connection_time_s: int = 30
+    # Duration of the host loop. 0 = run until Ctrl+C (recommended for Quest teleop).
+    connection_time_s: int = 0
 
     # Watchdog: stop the robot if no command is received for over 0.5 seconds.
     watchdog_timeout_ms: int = 500
 
     # If robot jitters decrease the frequency and monitor cpu load with `top` in cmd
     max_loop_freq_hz: int = 30
+
+    # Quest / VR teleop: skip interactive leader-follower calibration on startup.
+    calibrate_on_connect: bool = False
 
 
 @RobotConfig.register_subclass("lekiwi_client")

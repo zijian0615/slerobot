@@ -12,11 +12,13 @@ authors = [
     {name = "sLeRobot Team"}
 ]
 dependencies = [
+    "draccus>=0.8.0",
     "paho-mqtt>=1.6.1",
     "numpy>=1.20",
     "opencv-python>=4.5",
     "pillow>=9.0",
     "pyyaml>=5.4",
+    "pyzmq>=25.0",
 ]
 
 [tool.setuptools]
@@ -25,3 +27,8 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["slerobot*"]
+
+[project.scripts]
+slerobot-record = "slerobot.scripts.slerobot_record:record"
+slerobot-lekiwi-record = "slerobot.scripts.slerobot_lekiwi_record:record"
+slerobot-lekiwi-host = "slerobot.robots.lekiwi.lekiwi_host:main"

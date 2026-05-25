@@ -324,6 +324,8 @@ def record_loop(
     robot: Robot,
     events: dict,
     fps: int,
+    robot_backend: str = "fanuc",
+    quest_mapper: Any | None = None,
     teleop_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction] | None = None,
     robot_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction] | None = None,
     robot_observation_processor: RobotProcessorPipeline[RobotObservation, RobotObservation] | None = None,
@@ -376,6 +378,7 @@ def record_loop(
         robot_action_processor = robot_action_processor or default_robot_action_processor
         robot_observation_processor = robot_observation_processor or default_robot_observation_processor
 
+    use_fanuc_backend = robot_backend == "fanuc"
     BUFFER_SIZE = 4
     INTER_PACKET_DELAY = 0.002
 
@@ -385,6 +388,7 @@ def record_loop(
     no_action_count = 0
     timestamp = 0.0
     start_episode_t = time.perf_counter()
+    target_dt = 1.0 / fps
 
     action_sent_count = 0
     action_skipped_buffer_full = 0
@@ -393,6 +397,7 @@ def record_loop(
     diagnostic_interval_s = 1.0
 
     while True:
+        loop_start = time.perf_counter()
         if control_time_s is not None and timestamp >= control_time_s:
             break
 
@@ -400,20 +405,21 @@ def record_loop(
             events["exit_early"] = False
             break
 
-        while True:
-            seq_id, err = robot.check_ack()
-            if seq_id is None:
-                break
-            pending.discard(seq_id)
+        if use_fanuc_backend:
+            while True:
+                seq_id, err = robot.check_ack()
+                if seq_id is None:
+                    break
+                pending.discard(seq_id)
 
-        if len(pending) >= BUFFER_SIZE:
-            time.sleep(0.001)
-            action_skipped_buffer_full += 1
-            timestamp = time.perf_counter() - start_episode_t
-            continue
+            if len(pending) >= BUFFER_SIZE:
+                time.sleep(0.001)
+                action_skipped_buffer_full += 1
+                timestamp = time.perf_counter() - start_episode_t
+                continue
 
         obs = robot.get_observation()
-        if observation_grip_value is not None:
+        if use_fanuc_backend and observation_grip_value is not None:
             obs["j7"] = observation_grip_value
         obs = robot_observation_processor(obs)
 
@@ -507,6 +513,23 @@ def record_loop(
                 timestamp = time.perf_counter() - start_episode_t
                 continue
             act_processed_teleop = teleop_action_processor((act, obs))
+        elif policy is None and isinstance(teleop, list) and robot_backend == "lekiwi":
+            quest_ctrl, keyboard_ctrl = teleop
+            quest_act = quest_ctrl.get_action()
+            if quest_act is None:
+                time.sleep(0.005)
+                timestamp = time.perf_counter() - start_episode_t
+                continue
+            if quest_mapper is None:
+                raise ValueError("quest_mapper is required when robot_backend='lekiwi'")
+            keyboard_pressed = keyboard_ctrl.get_action()
+            base_action = (
+                robot._from_keyboard_to_base_action(keyboard_pressed)
+                if hasattr(robot, "_from_keyboard_to_base_action")
+                else {}
+            )
+            act = quest_mapper.map_action(quest_act, obs, base_action=base_action or None)
+            act_processed_teleop = teleop_action_processor((act, obs))
         elif policy is None and isinstance(teleop, list):
             teleop_arm, teleop_keyboard = teleop
             arm_action = teleop_arm.get_action()
@@ -533,47 +556,57 @@ def record_loop(
 
         no_action_count = 0
 
-        if policy is not None and act_processed_policy is not None:
-            encoded_action_values = encode_fanuc_pose_dict(act_processed_policy)
-            action_values = encoded_action_values
-            robot_action_to_send = robot_action_processor((decode_fanuc_pose_dict(encoded_action_values), obs))
-        else:
-            encoded_action_values = encode_fanuc_pose_dict(act_processed_teleop or {})
-            action_values = encoded_action_values
-            robot_action_to_send = robot_action_processor((decode_fanuc_pose_dict(encoded_action_values), obs))
+        if use_fanuc_backend:
+            if policy is not None and act_processed_policy is not None:
+                encoded_action_values = encode_fanuc_pose_dict(act_processed_policy)
+                action_values = encoded_action_values
+                robot_action_to_send = robot_action_processor(
+                    (decode_fanuc_pose_dict(encoded_action_values), obs)
+                )
+            else:
+                encoded_action_values = encode_fanuc_pose_dict(act_processed_teleop or {})
+                action_values = encoded_action_values
+                robot_action_to_send = robot_action_processor(
+                    (decode_fanuc_pose_dict(encoded_action_values), obs)
+                )
 
-        robot_action_to_send = _apply_robot_action_metadata(
-            robot_action_to_send,
-            robot_speed=robot_speed,
-            robot_term_type=robot_term_type,
-            robot_term_value=robot_term_value,
-            gripper_lcb_type=gripper_lcb_type,
-            gripper_lcb_value=gripper_lcb_value,
-            gripper_port_type=gripper_port_type,
-            gripper_port_number=gripper_port_number,
-            gripper_open_port_number=gripper_open_port_number,
-            gripper_close_port_number=gripper_close_port_number,
-            gripper_open_value=gripper_open_value,
-            gripper_close_value=gripper_close_value,
-        )
-        if policy is not None and act_processed_policy is not None:
-            _log_policy_action_flow(act_processed_policy, robot_action_to_send)
-        if "j7" in robot_action_to_send:
-            observation_grip_value = float(robot_action_to_send["j7"])
+            robot_action_to_send = _apply_robot_action_metadata(
+                robot_action_to_send,
+                robot_speed=robot_speed,
+                robot_term_type=robot_term_type,
+                robot_term_value=robot_term_value,
+                gripper_lcb_type=gripper_lcb_type,
+                gripper_lcb_value=gripper_lcb_value,
+                gripper_port_type=gripper_port_type,
+                gripper_port_number=gripper_port_number,
+                gripper_open_port_number=gripper_open_port_number,
+                gripper_close_port_number=gripper_close_port_number,
+                gripper_open_value=gripper_open_value,
+                gripper_close_value=gripper_close_value,
+            )
+            if policy is not None and act_processed_policy is not None:
+                _log_policy_action_flow(act_processed_policy, robot_action_to_send)
+            if "j7" in robot_action_to_send:
+                observation_grip_value = float(robot_action_to_send["j7"])
+        else:
+            action_values = dict(act_processed_teleop or {})
+            encoded_action_values = action_values
+            robot_action_to_send = robot_action_processor((action_values, obs))
 
         robot.send_action(robot_action_to_send)
 
-        seq_id = robot.seq_id - 1
-        pending.add(seq_id)
+        if use_fanuc_backend:
+            seq_id = robot.seq_id - 1
+            pending.add(seq_id)
 
         action_sent_count += 1
 
-        if len(pending) >= BUFFER_SIZE:
+        if use_fanuc_backend and len(pending) >= BUFFER_SIZE:
             time.sleep(INTER_PACKET_DELAY)
 
         if record_data and dataset is not None:
             action_frame_values = dict(encoded_action_values or {})
-            if "j7" in robot_action_to_send:
+            if use_fanuc_backend and "j7" in robot_action_to_send:
                 action_frame_values["j7"] = float(robot_action_to_send["j7"])
             action_frame = build_dataset_frame(dataset.features, action_frame_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
@@ -642,13 +675,19 @@ def record_loop(
 
         timestamp = time.perf_counter() - start_episode_t
 
+        if not use_fanuc_backend:
+            elapsed = time.perf_counter() - loop_start
+            time.sleep(max(target_dt - elapsed, 0.0))
+
         now = time.perf_counter()
         if now - last_diagnostic_time >= diagnostic_interval_s:
             actual_fps = action_sent_count / timestamp if timestamp > 0 else 0
+            pending_info = len(pending) if use_fanuc_backend else 0
+            skipped_info = action_skipped_buffer_full if use_fanuc_backend else 0
 
             print(
                 f"[FPS] t={timestamp:.1f}s actual={actual_fps:.2f}fps target={fps} "
-                f"sent={action_sent_count} pending={len(pending)} skipped_buffer={action_skipped_buffer_full}"
+                f"sent={action_sent_count} pending={pending_info} skipped_buffer={skipped_info}"
             )
 
             last_diagnostic_time = now

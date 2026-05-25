@@ -37,6 +37,17 @@ from .config_lekiwi import LeKiwiConfig
 logger = logging.getLogger(__name__)
 
 
+def _calibration_is_usable(calibration: dict[str, MotorCalibration]) -> bool:
+    if not calibration:
+        return False
+    for cal in calibration.values():
+        if cal.range_min >= cal.range_max:
+            return False
+        if cal.range_min == cal.range_max == 2047:
+            return False
+    return True
+
+
 class LeKiwi(Robot):
     """
     The robot includes a three omniwheel mobile base and a remote follower arm.
@@ -92,9 +103,12 @@ class LeKiwi(Robot):
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
-        return {
-            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
-        }
+        features = {}
+        for cam_key, cam in self.cameras.items():
+            height = cam.height or self.config.cameras[cam_key].height or 480
+            width = cam.width or self.config.cameras[cam_key].width or 640
+            features[cam_key] = (int(height), int(width), 3)
+        return features
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -106,21 +120,21 @@ class LeKiwi(Robot):
 
     @property
     def is_connected(self) -> bool:
-        return self.bus.is_connected and all(cam.is_connected for cam in self.cameras.values())
+        # Motors are required; cameras are optional (may fail on Pi USB bandwidth).
+        return self.bus.is_connected
 
     def connect(self, calibrate: bool = True) -> None:
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected")
 
         self.bus.connect()
-        if not self.is_calibrated and calibrate:
-            logger.info(
-                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
-            )
-            self.calibrate()
+        self._ensure_bus_calibration(calibrate=calibrate)
 
-        for cam in self.cameras.values():
-            cam.connect()
+        for cam_key, cam in self.cameras.items():
+            try:
+                cam.connect()
+            except Exception as exc:
+                logger.warning("Failed to connect camera '%s': %s", cam_key, exc)
 
         self.configure()
         logger.info(f"{self} connected.")
@@ -128,6 +142,37 @@ class LeKiwi(Robot):
     @property
     def is_calibrated(self) -> bool:
         return self.bus.is_calibrated
+
+    def _ensure_bus_calibration(self, *, calibrate: bool) -> None:
+        """Ensure self.bus.calibration is populated so sync_read/send_action work."""
+        if self.bus.calibration and _calibration_is_usable(self.bus.calibration):
+            return
+
+        if self.calibration and _calibration_is_usable(self.calibration):
+            logger.info("Loading calibration file %s into motors", self.calibration_fpath)
+            self.bus.write_calibration(self.calibration)
+            return
+
+        if not self.is_calibrated and calibrate:
+            logger.info(
+                "No valid calibration file — running interactive calibration (leader-arm style)."
+            )
+            self.calibrate()
+            return
+
+        motor_cal = self.bus.read_calibration()
+        if _calibration_is_usable(motor_cal):
+            logger.info("Using calibration stored in motor registers.")
+            self.calibration = motor_cal
+            self.bus.write_calibration(motor_cal)
+            self._save_calibration()
+            return
+
+        raise RuntimeError(
+            "LeKiwi motors are not calibrated. On the Raspberry Pi run once:\n"
+            "  slerobot-lekiwi-host --calibrate\n"
+            f"Or place a valid calibration file at:\n  {self.calibration_fpath}"
+        )
 
     def calibrate(self) -> None:
         if self.calibration:
@@ -362,6 +407,8 @@ class LeKiwi(Robot):
 
         # Capture images from cameras
         for cam_key, cam in self.cameras.items():
+            if not cam.is_connected:
+                continue
             start = time.perf_counter()
             obs_dict[cam_key] = cam.async_read()
             dt_ms = (time.perf_counter() - start) * 1e3
