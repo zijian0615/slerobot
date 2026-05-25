@@ -82,6 +82,10 @@ class Quest3sController(Teleoperator):
     def _on_message(self, client, userdata, msg):
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
+            if not getattr(self, "_logged_first_payload", False):
+                logger.info("[Quest3s] first MQTT payload keys: %s", list(payload.keys()))
+                logger.info("[Quest3s] first MQTT payload: %s", payload)
+                self._logged_first_payload = True
             action = self._parse_payload(payload, datetime.now())
             with self._lock:
                 self._latest_action = action
@@ -168,17 +172,27 @@ class Quest3sController(Teleoperator):
             "position": {"x": x, "y": y, "z": z},
             "rotation": {"w": w, "p": p, "r": r},
             "buttons": {
-                "trigger": payload.get("triggerButton", 0),
-                "grip": payload.get("gripButton", 0),
-                "a": int(
+                "trigger": int(payload.get(
+                    "triggerButton",
+                    payload.get("trigger", payload.get("Trigger", 0)),
+                )),
+                "grip": int(payload.get(
+                    "gripButton",
+                    payload.get("grip", payload.get("Grip", 0)),
+                )),
+                "a": int(payload.get(
+                    "a",
                     payload.get(
-                        "aButton",
+                        "A",
                         payload.get(
-                            "buttonA",
-                            payload.get("primaryButton", payload.get("A", payload.get("button_a", 0))),
+                            "aButton",
+                            payload.get(
+                                "buttonA",
+                                payload.get("primaryButton", payload.get("button_a", 0)),
+                            ),
                         ),
-                    )
-                ),
+                    ),
+                )),
             },
         }
         for key in (
