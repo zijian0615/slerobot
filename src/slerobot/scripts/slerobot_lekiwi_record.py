@@ -12,7 +12,7 @@ python -m slerobot.scripts.slerobot_lekiwi_record \
 
 # Pi: python -m slerobot.robots.lekiwi.lekiwi_host --no-cameras
 # Mac IK: pip install -e ".[kinematics]"
-# Arm: press A once, hold trigger, move hand (Fanuc VR offsets)
+# Arm: press A once (only A arms), hold trigger ~0.6s still, then move hand
 # Tune: --position_scale=0.7  --quest_axis_remap=z,-x,y  (try x,y,z if axes feel wrong)
 ```
 """
@@ -98,12 +98,12 @@ class LeKiwiRecordConfig:
     quest_pose_mode: str = "vr_offset"
     quest_axis_remap: str = "z,-x,y"
     position_scale: float = 1.0
-    orientation_weight: float = 0.15
-    max_joint_step_deg: float = 12.0
-    quest_delta_ema_alpha: float = 0.85
-    joint_output_alpha: float = 0.9
-    position_deadzone_mm: float = 0.5
-    rotation_deadzone_deg: float = 0.8
+    orientation_weight: float = 0.0
+    max_joint_step_deg: float = 8.0
+    quest_delta_ema_alpha: float = 0.65
+    joint_output_alpha: float = 0.55
+    position_deadzone_mm: float = 2.5
+    rotation_deadzone_deg: float = 3.0
     display_data: bool = False
     display_ip: str | None = None
     display_port: int | None = None

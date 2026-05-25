@@ -218,20 +218,21 @@ class LeKiwiQuestIK:
         *,
         quest_pose_mode: QuestPoseMode = "vr_offset",
         quest_axis_remap: str = "z,-x,y",
+        apply_quest_rotation: bool = False,
         position_weight: float = 1.0,
-        orientation_weight: float = 0.15,
+        orientation_weight: float = 0.0,
         quest_position_scale: float = 1.0,
         ee_position_scale_mm: float = 0.001,
-        max_delta_translation_m: float = 0.15,
+        max_delta_translation_m: float = 0.12,
         require_trigger: bool = True,
-        settle_frames_after_zero: int = 3,
-        warmup_frames_after_settle: int = 2,
+        settle_frames_after_zero: int = 12,
+        warmup_frames_after_settle: int = 0,
         ramp_frames: int = 0,
-        max_joint_step_deg: float = 12.0,
-        position_deadzone_mm: float = 0.5,
-        rotation_deadzone_deg: float = 0.8,
-        quest_delta_ema_alpha: float = 0.85,
-        joint_output_alpha: float = 0.9,
+        max_joint_step_deg: float = 8.0,
+        position_deadzone_mm: float = 2.5,
+        rotation_deadzone_deg: float = 3.0,
+        quest_delta_ema_alpha: float = 0.65,
+        joint_output_alpha: float = 0.55,
         resync_zero_during_settle: bool = True,
         use_degrees: bool = False,
         calibration: dict[str, MotorCalibration] | None = None,
@@ -275,6 +276,10 @@ class LeKiwiQuestIK:
         self._ramp_frames_remaining: int = 0
         self._logged_waiting_for_enable: bool = False
         self._logged_near_zero_offset: bool = False
+        self.apply_quest_rotation = apply_quest_rotation
+        self._mqtt_baseline: tuple[float, float, float, float, float, float] | None = None
+        self._settle_pose_sum: np.ndarray | None = None
+        self._settle_pose_count: int = 0
 
     def reset(self) -> None:
         self._ref_position = None
@@ -292,6 +297,9 @@ class LeKiwiQuestIK:
         self._ramp_frames_remaining = 0
         self._logged_waiting_for_enable = False
         self._logged_near_zero_offset = False
+        self._mqtt_baseline = None
+        self._settle_pose_sum = None
+        self._settle_pose_count = 0
 
     def _realign_reference(
         self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
@@ -299,22 +307,54 @@ class LeKiwiQuestIK:
         self._ref_position = (px, py, pz)
         self._ref_orientation = (rw, rp, rr)
 
-    def _latch_vr_offset_arm(self, *, source: str) -> None:
-        """Fanuc VR: MQTT already reports offsets — lock robot neutral on next IK frame."""
+    def _latch_vr_offset_arm(self) -> None:
+        """Arm on Quest A only — settle while hand still, then lock neutral + MQTT baseline."""
         self._zero_pose = None
         self._neutral_fk = None
         self._neutral_joint_deg = None
         self._filtered_delta = None
         self._last_target_deg = None
+        self._mqtt_baseline = None
+        self._settle_pose_sum = None
+        self._settle_pose_count = 0
         self._vr_zeroed = True
-        self._settle_frames = 0
+        self._settle_frames = self.settle_frames_after_zero
         self._warmup_frames = 0
         self._ramp_frames_remaining = 0
         self._logged_waiting_for_enable = False
         logger.info(
-            "Quest %s — arm teleop armed (vr_offset). Hold trigger and move; "
-            "robot neutral locks to current pose.",
-            source,
+            "Quest A — hold trigger, keep hand still ~%.1fs for neutral lock, then move.",
+            self.settle_frames_after_zero / 20.0,
+        )
+
+    def _accumulate_settle_pose(
+        self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
+    ) -> None:
+        sample = np.array([px, py, pz, rw, rp, rr], dtype=float)
+        if self._settle_pose_sum is None:
+            self._settle_pose_sum = sample
+            self._settle_pose_count = 1
+        else:
+            self._settle_pose_sum += sample
+            self._settle_pose_count += 1
+
+    def _finalize_vr_offset_settle(self, current_deg: np.ndarray) -> None:
+        if self._settle_pose_sum is not None and self._settle_pose_count > 0:
+            avg = self._settle_pose_sum / float(self._settle_pose_count)
+            self._mqtt_baseline = tuple(float(v) for v in avg)
+        else:
+            self._mqtt_baseline = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        self._neutral_fk = self.kinematics.forward_kinematics(current_deg)
+        self._neutral_joint_deg = current_deg.copy()
+        self._last_target_deg = current_deg.copy()
+        self._filtered_delta = None
+        self._settle_pose_sum = None
+        self._settle_pose_count = 0
+        logger.info(
+            "Teleop ready — neutral locked (MQTT baseline xyz=%.1f,%.1f,%.1f mm).",
+            self._mqtt_baseline[0],
+            self._mqtt_baseline[1],
+            self._mqtt_baseline[2],
         )
 
     def _latch_vr_zero(
@@ -371,9 +411,13 @@ class LeKiwiQuestIK:
     def _smooth_joint_target(
         self, raw_target_deg: np.ndarray, current_deg: np.ndarray
     ) -> np.ndarray:
-        base = current_deg if self.joint_output_alpha >= 0.85 else (
-            self._last_target_deg if self._last_target_deg is not None else current_deg
-        )
+        # Smooth from last command, not noisy motor feedback (avoids oscillation / twitch).
+        if self._last_target_deg is not None:
+            base = self._last_target_deg
+        elif self._neutral_joint_deg is not None:
+            base = self._neutral_joint_deg
+        else:
+            base = current_deg
         stepped = self._clamp_joint_deg_step(base, raw_target_deg)
         a = float(self.joint_output_alpha)
         if self._last_target_deg is None or a >= 0.999:
@@ -407,22 +451,28 @@ class LeKiwiQuestIK:
             self._neutral_joint_deg = None
             self._filtered_delta = None
             self._last_target_deg = None
+            self._mqtt_baseline = None
+            self._settle_pose_sum = None
+            self._settle_pose_count = 0
             self._settle_frames = 0
             self._warmup_frames = 0
             self._ramp_frames_remaining = 0
             self._logged_near_zero_offset = False
             logger.info("Quest trigger released — arm teleop disarmed (hold current pose).")
 
-        if (a_rising or trigger_rising) and self.quest_pose_mode in ("vr_offset", "local_zero"):
-            source = "A" if a_rising else "trigger"
-            if a_rising and trigger_rising:
-                source = "A+trigger"
-            if self.quest_pose_mode == "vr_offset":
-                self._latch_vr_offset_arm(source=source)
-            else:
-                self._latch_vr_zero(px, py, pz, rw, rp, rr, source=source)
+        # Arm only on Quest A — NOT on trigger, or squeezing trigger re-arms and twitches.
+        if a_rising and self.quest_pose_mode == "vr_offset":
+            self._latch_vr_offset_arm()
             self._logged_near_zero_offset = False
             return True
+        if a_rising and self.quest_pose_mode == "local_zero":
+            self._latch_vr_zero(px, py, pz, rw, rp, rr, source="A")
+            self._logged_near_zero_offset = False
+            return True
+        if trigger_rising and self.quest_pose_mode in ("vr_offset", "local_zero") and not self._vr_zeroed:
+            logger.info(
+                "Quest trigger — press A first to arm teleop (trigger alone does not re-zero)."
+            )
 
         if a_rising and self.quest_pose_mode == "absolute_pair":
             self._realign_reference(px, py, pz, rw, rp, rr)
@@ -457,43 +507,32 @@ class LeKiwiQuestIK:
         max_m = self.max_delta_translation_m * max(motion_scale, 0.05)
         return self._clamp_delta_translation(t_delta, max_m)
 
-    def _target_from_delta_world(
+    def _target_from_delta_ee_translation(
         self,
         neutral_T: np.ndarray,
         dx: float,
         dy: float,
         dz: float,
-        dw: float,
-        dp: float,
-        dr: float,
     ) -> np.ndarray:
-        """Apply Fanuc-style offset in robot-base frame (matches Fanuc VR teleop)."""
+        """Translation only in neutral EE frame — stable for VR hand tracking."""
         mx, my, mz = remap_quest_translation_mm(dx, dy, dz, self._axis_remap)
         scale = self.quest_position_scale * self.ee_position_scale_mm
-        trans = _clamp_translation_vec(
+        local = _clamp_translation_vec(
             np.array([mx, my, mz], dtype=float) * scale,
             self.max_delta_translation_m,
         )
-        R_delta = wpr_deg_to_rotation_matrix(dw, dp, dr)
-        out = neutral_T.copy()
-        out[:3, :3] = R_delta @ neutral_T[:3, :3]
-        out[:3, 3] = neutral_T[:3, 3] + trans
-        return out
-
-    def _ensure_neutral_locked(self, current_deg: np.ndarray) -> None:
-        if self._neutral_fk is not None:
-            return
-        self._neutral_fk = self.kinematics.forward_kinematics(current_deg)
-        self._neutral_joint_deg = current_deg.copy()
-        self._last_target_deg = current_deg.copy()
-        self._filtered_delta = None
-        logger.info("Teleop neutral locked to current arm pose.")
+        t_delta = np.eye(4, dtype=float)
+        t_delta[:3, 3] = local
+        return neutral_T @ t_delta
 
     def _quest_delta_for_ik(
         self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
     ) -> tuple[float, float, float, float, float, float]:
         if self.quest_pose_mode == "local_zero":
             return self._quest_offsets_from_zero(px, py, pz, rw, rp, rr)
+        if self.quest_pose_mode == "vr_offset" and self._mqtt_baseline is not None:
+            bx, by, bz, bw, bp, br = self._mqtt_baseline
+            return px - bx, py - by, pz - bz, rw - bw, rp - bp, rr - br
         return px, py, pz, rw, rp, rr
 
     def _reset_delta_tracking(
@@ -539,29 +578,36 @@ class LeKiwiQuestIK:
         rr: float,
         current_deg: np.ndarray,
     ) -> np.ndarray:
-        self._ensure_neutral_locked(current_deg)
-        assert self._neutral_fk is not None
+        if self._neutral_fk is None:
+            return current_deg
 
         dx, dy, dz, dw, dp, dr = self._quest_smoothed_delta_for_ik(px, py, pz, rw, rp, rr)
+        if not self.apply_quest_rotation:
+            dw, dp, dr = 0.0, 0.0, 0.0
         if self._pose_delta_below_deadzone(dx, dy, dz, dw, dp, dr):
             if self._last_target_deg is not None:
                 return self._last_target_deg.copy()
-            return current_deg
+            return self._neutral_joint_deg.copy() if self._neutral_joint_deg is not None else current_deg
 
-        if self.quest_pose_mode == "vr_offset":
-            t_target = self._target_from_delta_world(
-                self._neutral_fk, dx, dy, dz, dw, dp, dr
-            )
-        else:
+        if self.apply_quest_rotation:
             t_delta = self._delta_matrix_from_quest(dx, dy, dz, dw, dp, dr, motion_scale=1.0)
             t_target = self._neutral_fk @ t_delta
+            ori_w = self.orientation_weight
+        else:
+            t_target = self._target_from_delta_ee_translation(self._neutral_fk, dx, dy, dz)
+            ori_w = 0.0
 
-        ik_seed = current_deg
+        if self._last_target_deg is not None:
+            ik_seed = self._last_target_deg
+        elif self._neutral_joint_deg is not None:
+            ik_seed = self._neutral_joint_deg
+        else:
+            ik_seed = current_deg
         raw_target = self.kinematics.inverse_kinematics(
             ik_seed,
             t_target,
             position_weight=self.position_weight,
-            orientation_weight=self.orientation_weight,
+            orientation_weight=ori_w,
         )
         target_deg = self._smooth_joint_target(raw_target, current_deg)
         self._last_target_deg = target_deg.copy()
@@ -638,6 +684,13 @@ class LeKiwiQuestIK:
                     "(or press trigger once if A is not in MQTT), then move hand."
                 )
                 self._logged_waiting_for_enable = True
+            return hold
+
+        if self.quest_pose_mode == "vr_offset" and self._settle_frames > 0:
+            self._accumulate_settle_pose(px, py, pz, rw, rp, rr)
+            self._settle_frames -= 1
+            if self._settle_frames == 0:
+                self._finalize_vr_offset_settle(current_deg)
             return hold
 
         if self.quest_pose_mode == "local_zero":

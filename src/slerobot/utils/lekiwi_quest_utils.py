@@ -23,21 +23,22 @@ class LeKiwiQuestMapperConfig:
     # Fanuc VR MQTT: offsets from A-button zero (see ``vr_offset`` in lekiwi_ik).
     quest_pose_mode: str = "vr_offset"
     quest_axis_remap: str = "z,-x,y"
+    apply_quest_rotation: bool = False
     use_degrees: bool = False
     quest_position_scale: float = 1.0
     ee_position_scale_mm: float = 0.001
     position_weight: float = 1.0
-    orientation_weight: float = 0.15
-    max_delta_translation_m: float = 0.15
+    orientation_weight: float = 0.0
+    max_delta_translation_m: float = 0.12
     require_trigger: bool = True
-    settle_frames_after_zero: int = 3
-    warmup_frames_after_settle: int = 2
+    settle_frames_after_zero: int = 12
+    warmup_frames_after_settle: int = 0
     ramp_frames: int = 0
-    max_joint_step_deg: float = 12.0
-    position_deadzone_mm: float = 0.5
-    rotation_deadzone_deg: float = 0.8
-    quest_delta_ema_alpha: float = 0.85
-    joint_output_alpha: float = 0.9
+    max_joint_step_deg: float = 8.0
+    position_deadzone_mm: float = 2.5
+    rotation_deadzone_deg: float = 3.0
+    quest_delta_ema_alpha: float = 0.65
+    joint_output_alpha: float = 0.55
     resync_zero_during_settle: bool = True
     gripper_open: float = 0.0
     gripper_closed: float = 100.0
@@ -154,6 +155,7 @@ class LeKiwiQuestMapper:
                 urdf,
                 quest_pose_mode=self.config.quest_pose_mode,  # type: ignore[arg-type]
                 quest_axis_remap=self.config.quest_axis_remap,
+                apply_quest_rotation=self.config.apply_quest_rotation,
                 position_weight=self.config.position_weight,
                 orientation_weight=self.config.orientation_weight,
                 max_delta_translation_m=self.config.max_delta_translation_m,
