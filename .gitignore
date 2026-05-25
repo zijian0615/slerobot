@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Secrets & local env
+.env
+.env.*
+*.pem
+*.key
+
+# Local UI / robot config (use config.example.json as template)
+src/slerobot/attack_defense_ui/config.json
+src/slerobot/attack_defense_ui/session_state.json
+
+# Private / machine-specific scripts (optional local only)
+src/private.py
+src/abort.py
+src/moveLinear.py
+src/slerobot/test/private.py
+
+# UI backups
+*_old.html
+*_old.css
+
+# Data & artifacts
+data/
+datasets/
+outputs/
+checkpoints/
+logs/
+*.mp4
+*.avi
+*.mkv
+wandb/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Hugging Face cache (if ever under repo)
+.cache/

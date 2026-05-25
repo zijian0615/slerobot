@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Local web UI to launch ATTACK (CAM on) vs DEFENSE (CAM off) recording sessions."""
+"""Local web UI: ATTACK / DETECT / MITIGATION recording sessions."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from slerobot.attack_defense_ui.repo_state import MODES, allocate_repo_index, peek_next_repo_ids
 from slerobot.attack_defense_ui.telemetry_hub import TELEMETRY
 
 UI_DIR = Path(__file__).resolve().parent
@@ -28,6 +29,9 @@ class RecordingSession:
         self._lock = threading.Lock()
         self._process: subprocess.Popen | None = None
         self._mode: str | None = None
+        self._last_repo_id: str | None = None
+        self._last_repo_index: int | None = None
+        self._homeset_running = False
         self._log_lines: list[str] = []
         self._max_log_lines = 400
 
@@ -55,12 +59,51 @@ class RecordingSession:
         with CONFIG_PATH.open(encoding="utf-8") as f:
             return json.load(f)
 
-    def _build_command(self, mode: str) -> list[str]:
-        cfg = self._load_config()
-        attention_on = mode == "attack"
-        repo_id = cfg["repo_id_attack"] if attention_on else cfg["repo_id_defense"]
+    def _run_homeset(self, cfg: dict) -> None:
+        script = Path(
+            cfg.get(
+                "move_linear_script",
+                REPO_ROOT / "src" / "slerobot" / "test" / "moveLinear.py",
+            )
+        )
+        if not script.is_absolute():
+            script = REPO_ROOT / script
+        if not script.is_file():
+            raise FileNotFoundError(f"Home set script not found: {script}")
 
-        return [
+        timeout_s = int(cfg.get("move_linear_timeout_s", 120))
+        self._append_log(f"[UI] Home set → {script}")
+        self._homeset_running = True
+        homeset_env = os.environ.copy()
+        homeset_env["ROBOT_HOST"] = str(cfg.get("robot_host", "127.0.0.1"))
+        homeset_env["ROBOT_PORT"] = str(cfg.get("robot_port", 16001))
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script)],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                env=homeset_env,
+            )
+            if result.stdout:
+                for line in result.stdout.splitlines():
+                    self._append_log(line)
+            if result.stderr:
+                for line in result.stderr.splitlines():
+                    self._append_log(line)
+            if result.returncode != 0:
+                tail = (result.stderr or result.stdout or "").strip()[-400:]
+                raise RuntimeError(f"Home set exited with code {result.returncode}: {tail}")
+            self._append_log("[UI] Home set completed")
+        finally:
+            self._homeset_running = False
+
+    def _build_command(self, mode: str, repo_id: str) -> list[str]:
+        cfg = self._load_config()
+        attention_on = mode in ("detect", "mitigation")
+
+        cmd = [
             sys.executable,
             "-m",
             "slerobot.scripts.slerobot_record",
@@ -74,16 +117,25 @@ class RecordingSession:
             f"--dataset.reset_time_s={cfg['reset_time_s']}",
             f"--policy.path={cfg['policy_path']}",
             "--display_data=true",
-            "--realtime_attention_display=true",
-            f"--policy.attention_cam_method={cfg['attention_cam_method']}",
-            f"--policy.grad_cam_target_action_index={cfg['grad_cam_target_action_index']}",
-            f"--policy.grad_cam_edge_margin_px={cfg['grad_cam_edge_margin_px']}",
-            f"--policy.grad_cam_edge_mean_threshold={cfg['grad_cam_edge_mean_threshold']}",
-            f"--policy.cam_warning_high_activation_threshold={cfg['cam_warning_high_activation_threshold']}",
-            f"--policy.attention_camera={cfg['attention_camera']}",
-            f"--tts_voice={cfg['tts_voice']}",
+            f"--realtime_attention_display={'true' if attention_on else 'false'}",
             f"--enable_attention_visualization={'true' if attention_on else 'false'}",
+            f"--tts_voice={cfg['tts_voice']}",
         ]
+
+        if attention_on:
+            roi_mode = "detect" if mode == "detect" else "mitigation"
+            cmd.extend(
+                [
+                    f"--policy.attention_cam_method={cfg['attention_cam_method']}",
+                    f"--policy.grad_cam_target_action_index={cfg['grad_cam_target_action_index']}",
+                    f"--policy.grad_cam_edge_margin_px={cfg['grad_cam_edge_margin_px']}",
+                    f"--policy.grad_cam_edge_mean_threshold={cfg['grad_cam_edge_mean_threshold']}",
+                    f"--policy.cam_warning_high_activation_threshold={cfg['cam_warning_high_activation_threshold']}",
+                    f"--policy.attention_camera={cfg['attention_camera']}",
+                    f"--policy.attention_roi_mode={roi_mode}",
+                ]
+            )
+        return cmd
 
     def _reader_thread(self, stream) -> None:
         for raw in iter(stream.readline, b""):
@@ -94,18 +146,30 @@ class RecordingSession:
             if text:
                 self._append_log(text)
 
-    def start(self, mode: str) -> dict:
-        if mode not in ("attack", "defense"):
-            raise ValueError("mode must be 'attack' or 'defense'")
+    def start(self, mode: str, *, homeset: bool = False) -> dict:
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {MODES}")
 
         with self._lock:
             if self._process is not None and self._process.poll() is None:
                 raise RuntimeError(f"Session already running in {self._mode!r} mode. Stop it first.")
+            if self._homeset_running:
+                raise RuntimeError("Home set is already running. Please wait.")
 
         self.stop()
         TELEMETRY.reset()
 
-        cmd = self._build_command(mode)
+        cfg = self._load_config()
+        if homeset:
+            self._run_homeset(cfg)
+
+        repo_index, repo_ids = allocate_repo_index(cfg)
+        repo_id = repo_ids[mode]
+        self._last_repo_id = repo_id
+        self._last_repo_index = repo_index
+
+        cmd = self._build_command(mode, repo_id)
+        self._append_log(f"[UI] dataset.repo_id={repo_id} (index={repo_index})")
         self._append_log(f"[UI] Starting {mode.upper()} → {' '.join(cmd)}")
 
         telemetry_url = f"http://127.0.0.1:{UI_PORT}/api/telemetry/push"
@@ -131,11 +195,17 @@ class RecordingSession:
         threading.Thread(target=self._reader_thread, args=(process.stdout,), daemon=True).start()
         threading.Thread(target=self._wait_thread, args=(process,), daemon=True).start()
 
+        next_index, next_repos = peek_next_repo_ids(cfg)
         return {
             "ok": True,
             "mode": mode,
             "pid": process.pid,
-            "attention_visualization": mode == "attack",
+            "repo_id": repo_id,
+            "repo_index": repo_index,
+            "next_repo_index": next_index,
+            "next_repo_ids": next_repos,
+            "homeset_ran": homeset,
+            "attention_visualization": mode in ("detect", "mitigation"),
             "telemetry": True,
             "command": cmd,
         }
@@ -181,10 +251,17 @@ class RecordingSession:
         return {"ok": True, "stopped": True, "mode": mode}
 
     def status(self) -> dict:
+        cfg = self._load_config()
+        next_index, next_repos = peek_next_repo_ids(cfg)
         return {
             "running": self.running,
+            "homeset_running": self._homeset_running,
             "mode": self.mode,
             "pid": self._process.pid if self.running and self._process else None,
+            "last_repo_id": self._last_repo_id,
+            "last_repo_index": self._last_repo_index,
+            "next_repo_index": next_index,
+            "next_repo_ids": next_repos,
             "telemetry": True,
             "logs": self.get_logs(),
         }
@@ -263,7 +340,12 @@ class ControlHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/start":
                 mode = body.get("mode", "attack")
-                return self._send_json(SESSION.start(mode))
+                homeset = bool(body.get("homeset", False))
+                return self._send_json(SESSION.start(mode, homeset=homeset))
+            if parsed.path == "/api/homeset":
+                cfg = SESSION._load_config()
+                SESSION._run_homeset(cfg)
+                return self._send_json({"ok": True, "message": "Home set completed"})
             if parsed.path == "/api/stop":
                 return self._send_json(SESSION.stop())
             if parsed.path == "/api/telemetry/push":

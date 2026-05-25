@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>SLEROBOT // ATTACK · DEFENSE</title>
+    <title>SLEROBOT // ATTACK · DETECT · MITIGATION</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -17,8 +17,10 @@
     <div class="scanlines" aria-hidden="true"></div>
     <div class="shell">
       <header class="topbar">
-        <div class="glitch-title" data-text="SLEROBOT OPS">SLEROBOT OPS</div>
-        <p class="subtitle">ATTACK / DEFENSE · LIVE CAMERAS · ACTION TRACES</p>
+        <div class="topbar-main">
+          <div class="glitch-title" data-text="SLEROBOT OPS">SLEROBOT OPS</div>
+          <span class="subtitle">ATTACK · DETECT · MITIGATION</span>
+        </div>
         <div class="status-row">
           <span id="status-pill" class="pill idle">STANDBY</span>
           <span id="mode-label" class="mode-label">—</span>
@@ -27,21 +29,39 @@
         </div>
       </header>
 
+      <section class="prep-row">
+        <label class="homeset-toggle">
+          <input id="chk-homeset" type="checkbox" checked />
+          <span>Home set</span>
+          <span class="homeset-hint">run moveLinear.py before record</span>
+        </label>
+        <div class="repo-preview">
+          <span class="repo-preview-label">NEXT REPO</span>
+          <span id="repo-label" class="repo-preview-value">—</span>
+        </div>
+        <button id="btn-homeset-only" class="homeset-btn" type="button">RUN HOME</button>
+      </section>
+
       <section class="controls">
         <button id="btn-attack" class="mode-btn attack" type="button">
           <span class="btn-glyph">⚡</span>
           <span class="btn-title">ATTACK</span>
-          <span class="btn-desc">Grad-CAM++ · ROI warning · mitigation</span>
+          <span class="btn-desc" hidden>policy only · no CAM · no warning</span>
         </button>
-        <button id="btn-defense" class="mode-btn defense" type="button">
+        <button id="btn-detect" class="mode-btn detect" type="button">
+          <span class="btn-glyph">◎</span>
+          <span class="btn-title">DETECT</span>
+          <span class="btn-desc" hidden>2× cam + Grad-CAM · warning · no mask</span>
+        </button>
+        <button id="btn-mitigation" class="mode-btn mitigation" type="button">
           <span class="btn-glyph">🛡</span>
-          <span class="btn-title">DEFENSE</span>
-          <span class="btn-desc">Policy only · no attention CAM</span>
+          <span class="btn-title">MITIGATION</span>
+          <span class="btn-desc" hidden>2× cam · warning · ROI whiteout</span>
         </button>
         <button id="btn-stop" class="mode-btn stop" type="button" disabled>
           <span class="btn-glyph">■</span>
           <span class="btn-title">ABORT</span>
-          <span class="btn-desc">Terminate recording process</span>
+          <span class="btn-desc" hidden>Terminate recording</span>
         </button>
       </section>
 
@@ -51,29 +71,62 @@
             <h2>LIVE FEED</h2>
             <span id="feed-meta" class="feed-meta">waiting…</span>
           </div>
-          <div class="camera-grid">
-            <figure class="cam-card">
-              <figcaption>FRONT</figcaption>
-              <img id="cam-front" alt="front camera" />
-            </figure>
-            <figure class="cam-card">
-              <figcaption id="side-caption">SIDE</figcaption>
-              <img id="cam-side" alt="side camera" />
-            </figure>
+          <div class="live-panel-body">
+            <div class="camera-section">
+              <p class="camera-section-label">CAMERA</p>
+              <div class="camera-grid">
+                <figure class="cam-card">
+                  <figcaption>FRONT</figcaption>
+                  <div class="cam-img-wrap">
+                    <img id="cam-front" alt="front camera" />
+                  </div>
+                </figure>
+                <figure class="cam-card">
+                  <figcaption id="side-caption">SIDE</figcaption>
+                  <div class="cam-img-wrap">
+                    <img id="cam-side" alt="side camera" />
+                  </div>
+                </figure>
+              </div>
+            </div>
+            <div id="cam-overlay-section" class="camera-section hidden">
+              <p class="camera-section-label">GRAD-CAM</p>
+              <div class="camera-grid">
+                <figure class="cam-card">
+                  <figcaption id="front-cam-caption">FRONT · GRAD-CAM</figcaption>
+                  <div class="cam-img-wrap">
+                    <img id="cam-front-cam" alt="front grad-cam" />
+                  </div>
+                </figure>
+                <figure class="cam-card">
+                  <figcaption id="side-cam-caption">SIDE · GRAD-CAM</figcaption>
+                  <div class="cam-img-wrap">
+                    <img id="cam-side-cam" alt="side grad-cam" />
+                  </div>
+                </figure>
+              </div>
+            </div>
           </div>
-          <div class="charts-head">
-            <h3>ACTION TRAJECTORIES</h3>
-            <span class="charts-hint">j0 j1 j2 · j3 j4 j5 · j7</span>
-          </div>
-          <div class="charts-grid" id="charts-grid"></div>
         </section>
 
-        <section class="panel log-panel">
-          <div class="panel-head">
-            <h2>TERMINAL</h2>
-            <span id="log-meta" class="log-meta">0 lines</span>
-          </div>
-          <pre id="terminal" class="terminal" aria-live="polite"></pre>
+        <section class="side-panel">
+          <section class="panel chart-panel">
+            <div class="panel-head">
+              <h2>ACTION TRAJECTORIES</h2>
+              <span class="charts-hint">j0–j7 · normalized overlay</span>
+            </div>
+            <div class="chart-wrap">
+              <canvas id="action-chart" aria-label="action trajectories"></canvas>
+              <div id="chart-legend" class="chart-legend"></div>
+            </div>
+          </section>
+          <section class="panel log-panel">
+            <div class="panel-head">
+              <h2>TERMINAL</h2>
+              <span id="log-meta" class="log-meta">0 lines</span>
+            </div>
+            <pre id="terminal" class="terminal" aria-live="polite"></pre>
+          </section>
         </section>
       </main>
 

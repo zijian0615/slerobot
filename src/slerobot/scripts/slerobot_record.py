@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,7 +35,12 @@ from slerobot.policies.factory import get_policy_class, make_pre_post_processors
 from slerobot.utils.control_utils import init_keyboard_listener, is_headless, predict_action
 from slerobot.utils.robot_utils import decode_fanuc_pose_dict, encode_fanuc_pose_dict
 from slerobot.utils.utils import get_safe_torch_device, init_logging, log_say
-from slerobot.utils.visualization_utils import _init_rerun, log_rerun_data
+from slerobot.utils.live_telemetry import push_live_telemetry
+from slerobot.utils.visualization_utils import _init_rerun, log_rerun_data, shutdown_rerun
+
+
+def _ui_telemetry_enabled() -> bool:
+    return os.getenv("SLEROBOT_TELEMETRY_PUSH", "").lower() in ("1", "true", "yes")
 
 from slerobot.processor import (
     PolicyAction,
@@ -382,6 +388,7 @@ def record_loop(
 
     action_sent_count = 0
     action_skipped_buffer_full = 0
+    rerun_step = 0
     last_diagnostic_time = time.perf_counter()
     diagnostic_interval_s = 1.0
 
@@ -589,25 +596,49 @@ def record_loop(
                         )
                         if image_key in policy.last_grad_cam_edge_stats:
                             grad_cam_edge_stats_for_obs[camera_key] = policy.last_grad_cam_edge_stats[image_key]
-            log_rerun_data(
-                obs,
-                robot_action_to_send,
-                attention_maps=attention_maps_for_obs,
-                grad_cam_edge_warnings=grad_cam_edge_warnings_for_obs,
-                grad_cam_edge_stats=grad_cam_edge_stats_for_obs,
-                grad_cam_edge_threshold=policy.config.grad_cam_edge_mean_threshold
-                if isinstance(policy, ACTPolicy)
-                else None,
-                grad_cam_edge_margin_px=policy.config.grad_cam_edge_margin_px
-                if isinstance(policy, ACTPolicy)
-                else None,
-                grad_cam_edge_roi_mode=policy.config.attention_roi_mode
-                if isinstance(policy, ACTPolicy)
-                else "mitigation",
-                attention_overlay_helper=policy.attention_overlay_helper
-                if isinstance(policy, ACTPolicy)
-                else ACTEigenCAMHelper,
-            )
+            if _ui_telemetry_enabled():
+                push_live_telemetry(
+                    obs,
+                    robot_action_to_send,
+                    step=rerun_step,
+                    attention_maps=attention_maps_for_obs,
+                    grad_cam_edge_warnings=grad_cam_edge_warnings_for_obs,
+                    grad_cam_edge_stats=grad_cam_edge_stats_for_obs,
+                    grad_cam_edge_threshold=policy.config.grad_cam_edge_mean_threshold
+                    if isinstance(policy, ACTPolicy)
+                    else None,
+                    grad_cam_edge_margin_px=policy.config.grad_cam_edge_margin_px
+                    if isinstance(policy, ACTPolicy)
+                    else None,
+                    grad_cam_edge_roi_mode=policy.config.attention_roi_mode
+                    if isinstance(policy, ACTPolicy)
+                    else "mitigation",
+                    attention_overlay_helper=policy.attention_overlay_helper
+                    if isinstance(policy, ACTPolicy)
+                    else ACTEigenCAMHelper,
+                )
+            else:
+                log_rerun_data(
+                    obs,
+                    robot_action_to_send,
+                    attention_maps=attention_maps_for_obs,
+                    grad_cam_edge_warnings=grad_cam_edge_warnings_for_obs,
+                    grad_cam_edge_stats=grad_cam_edge_stats_for_obs,
+                    grad_cam_edge_threshold=policy.config.grad_cam_edge_mean_threshold
+                    if isinstance(policy, ACTPolicy)
+                    else None,
+                    grad_cam_edge_margin_px=policy.config.grad_cam_edge_margin_px
+                    if isinstance(policy, ACTPolicy)
+                    else None,
+                    grad_cam_edge_roi_mode=policy.config.attention_roi_mode
+                    if isinstance(policy, ACTPolicy)
+                    else "mitigation",
+                    attention_overlay_helper=policy.attention_overlay_helper
+                    if isinstance(policy, ACTPolicy)
+                    else ACTEigenCAMHelper,
+                    control_step=rerun_step,
+                )
+            rerun_step += 1
 
         timestamp = time.perf_counter() - start_episode_t
 
@@ -741,7 +772,20 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
             time.sleep(2.0)
 
         listener, events = init_keyboard_listener()
-        _init_rerun(session_name="slerobot_record")
+        if cfg.display_data and not _ui_telemetry_enabled():
+            if os.environ.get("SLEROBOT_RERUN_CONNECT_ONLY") == "1":
+                grpc_port = int(os.environ.get("SLEROBOT_RERUN_GRPC_PORT", "9876"))
+                _init_rerun(
+                    session_name="slerobot_record",
+                    connect_ip="127.0.0.1",
+                    connect_port=grpc_port,
+                )
+            else:
+                _init_rerun(
+                    session_name="slerobot_record",
+                    connect_ip=cfg.display_ip,
+                    connect_port=cfg.display_port,
+                )
         # Initialize Rerun for real-time attention visualization if enabled
         # if cfg.realtime_attention_display and HAS_RERUN and cfg.enable_attention_visualization:
         #     try:
@@ -913,13 +957,8 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
         if listener is not None and not is_headless():
             listener.stop()
 
-        # Close Rerun connection if it was opened
-        # if cfg.realtime_attention_display and HAS_RERUN:
-        #     try:
-        #         rr.disconnect()
-        #         logging.info("Rerun connection closed")
-        #     except Exception as e:
-        #         logging.debug(f"Error closing Rerun connection: {e}")
+        if cfg.display_data and not _ui_telemetry_enabled():
+            shutdown_rerun()
 
         if dataset is not None and cfg.dataset.push_to_hub:
             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)

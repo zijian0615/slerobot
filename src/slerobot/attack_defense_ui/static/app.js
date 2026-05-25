@@ -1,8 +1,12 @@
 const $ = (sel) => document.querySelector(sel);
 
 const btnAttack = $("#btn-attack");
-const btnDefense = $("#btn-defense");
+const btnDetect = $("#btn-detect");
+const btnMitigation = $("#btn-mitigation");
 const btnStop = $("#btn-stop");
+const btnHomesetOnly = $("#btn-homeset-only");
+const chkHomeset = $("#chk-homeset");
+const repoLabel = $("#repo-label");
 const statusPill = $("#status-pill");
 const modeLabel = $("#mode-label");
 const pidLabel = $("#pid-label");
@@ -13,7 +17,17 @@ const feedMeta = $("#feed-meta");
 const camFront = $("#cam-front");
 const camSide = $("#cam-side");
 const sideCaption = $("#side-caption");
-const chartsGrid = $("#charts-grid");
+const camOverlaySection = $("#cam-overlay-section");
+const camFrontCam = $("#cam-front-cam");
+const camSideCam = $("#cam-side-cam");
+const frontCamCaption = $("#front-cam-caption");
+const sideCamCaption = $("#side-cam-caption");
+const actionChart = $("#action-chart");
+const chartLegend = $("#chart-legend");
+
+const MODE_BUTTONS = [btnAttack, btnDetect, btnMitigation];
+
+let currentMode = null;
 
 const ACTION_KEYS = ["j0", "j1", "j2", "j3", "j4", "j5", "j7"];
 const CHART_COLORS = [
@@ -29,12 +43,13 @@ const CHART_COLORS = [
 let pollTimer = null;
 let telemetryTimer = null;
 let isRunning = false;
-const chartCanvases = {};
+let lastSeries = null;
+let chartResizeObserver = null;
 
 function drawMatrix() {
   const canvas = $("#matrix");
   const ctx = canvas.getContext("2d");
-  const chars = "01アイウエオｱｲｳｴｵATTACKDEFENSECAMROI";
+  const chars = "01アイウエオATTACKDETECTMITIGATIONCAMROI";
   let cols;
   let drops;
 
@@ -66,57 +81,108 @@ function drawMatrix() {
   tick();
 }
 
-function initCharts() {
-  chartsGrid.innerHTML = "";
-  ACTION_KEYS.forEach((key, idx) => {
-    const wrap = document.createElement("div");
-    wrap.className = "chart-card";
-    const label = document.createElement("span");
-    label.className = "chart-label";
-    label.textContent = key;
-    const canvas = document.createElement("canvas");
-    canvas.width = 220;
-    canvas.height = 72;
-    wrap.append(label, canvas);
-    chartsGrid.appendChild(wrap);
-    chartCanvases[key] = { canvas, color: CHART_COLORS[idx % CHART_COLORS.length] };
-  });
+function resizeActionChart() {
+  const wrap = actionChart.parentElement;
+  if (!wrap) return;
+  const rect = wrap.getBoundingClientRect();
+  const legendH = chartLegend.offsetHeight || 24;
+  const h = Math.max(100, rect.height - legendH - 8);
+  const w = Math.max(120, rect.width);
+  const dpr = window.devicePixelRatio || 1;
+  actionChart.width = Math.floor(w * dpr);
+  actionChart.height = Math.floor(h * dpr);
+  actionChart.style.width = `${w}px`;
+  actionChart.style.height = `${h}px`;
+  const ctx = actionChart.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (lastSeries) {
+    drawCombinedChart(lastSeries);
+  }
 }
 
-function drawSeries(canvas, values, color) {
-  const ctx = canvas.getContext("2d");
-  const w = canvas.width;
-  const h = canvas.height;
-  const pad = 6;
-  ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = "rgba(0, 20, 12, 0.55)";
-  ctx.fillRect(0, 0, w, h);
-
+function normalizeSeries(values) {
   const finite = values.filter((v) => Number.isFinite(v));
-  if (finite.length < 2) return;
-
+  if (finite.length === 0) return [];
   let min = Math.min(...finite);
   let max = Math.max(...finite);
   if (Math.abs(max - min) < 1e-9) {
     min -= 1;
     max += 1;
   }
+  return finite.map((v) => (v - min) / (max - min));
+}
 
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  finite.forEach((v, i) => {
-    const x = pad + (i / (finite.length - 1)) * (w - pad * 2);
-    const y = h - pad - ((v - min) / (max - min)) * (h - pad * 2);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
+function chartMutedColor() {
+  return getComputedStyle(document.documentElement).getPropertyValue("--muted").trim() || "#5f9f78";
+}
+
+function drawCombinedChart(series) {
+  const ctx = actionChart.getContext("2d");
+  const w = actionChart.clientWidth;
+  const h = actionChart.clientHeight;
+  const padL = 28;
+  const padR = 8;
+  const padT = 10;
+  const padB = 16;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "rgba(0, 20, 12, 0.55)";
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.strokeStyle = "rgba(0, 255, 120, 0.12)";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + (i / 4) * (h - padT - padB);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(w - padR, y);
+    ctx.stroke();
+  }
+
+  const legendItems = [];
+
+  ACTION_KEYS.forEach((key, idx) => {
+    const raw = series[key] || [];
+    const norm = normalizeSeries(raw);
+    if (norm.length < 2) return;
+
+    const color = CHART_COLORS[idx % CHART_COLORS.length];
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    norm.forEach((v, i) => {
+      const x = padL + (i / (norm.length - 1)) * (w - padL - padR);
+      const y = padT + (1 - v) * (h - padT - padB);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    const lastRaw = raw.filter((v) => Number.isFinite(v)).pop();
+    legendItems.push({ key, color, last: lastRaw });
   });
-  ctx.stroke();
 
-  const last = finite[finite.length - 1];
-  ctx.fillStyle = color;
-  ctx.font = "10px monospace";
-  ctx.fillText(last.toFixed(3), pad, 12);
+  ctx.fillStyle = chartMutedColor();
+  ctx.font = "9px monospace";
+  ctx.fillText("0", 4, h - padB);
+  ctx.fillText("1", 4, padT + 8);
+
+  chartLegend.innerHTML = legendItems
+    .map(
+      ({ key, color, last }) =>
+        `<span class="legend-item"><span class="legend-swatch" style="background:${color}"></span>${key} ${last != null ? last.toFixed(2) : "—"}</span>`,
+    )
+    .join("");
+}
+
+function initCharts() {
+  resizeActionChart();
+  if (chartResizeObserver) {
+    chartResizeObserver.disconnect();
+  }
+  chartResizeObserver = new ResizeObserver(() => resizeActionChart());
+  chartResizeObserver.observe(actionChart.parentElement);
+  window.addEventListener("resize", resizeActionChart);
 }
 
 function setImg(el, b64) {
@@ -137,11 +203,42 @@ async function api(path, body) {
   return data;
 }
 
+function applyViewLayout(mode) {
+  currentMode = mode;
+  camOverlaySection.classList.toggle("hidden", mode !== "detect");
+  requestAnimationFrame(resizeActionChart);
+}
+
+function updateRepoPreview(data) {
+  if (!data) return;
+  const idx = data.next_repo_index ?? data.repo_index;
+  const repos = data.next_repo_ids;
+  if (repos && idx != null) {
+    repoLabel.textContent = `#${idx} · ${repos.attack} | ${repos.detect} | ${repos.mitigation}`;
+  } else if (data.repo_id) {
+    repoLabel.textContent = data.repo_id;
+  }
+}
+
+function setBusyHomeset(busy) {
+  const disabled = Boolean(busy);
+  btnHomesetOnly.disabled = disabled;
+  chkHomeset.disabled = disabled;
+  if (!isRunning) {
+    MODE_BUTTONS.forEach((btn) => {
+      btn.disabled = disabled;
+    });
+  }
+}
+
 function setRunning(mode, pid) {
   isRunning = true;
-  btnAttack.disabled = true;
-  btnDefense.disabled = true;
+  applyViewLayout(mode);
+  MODE_BUTTONS.forEach((btn) => {
+    btn.disabled = true;
+  });
   btnStop.disabled = false;
+  btnHomesetOnly.disabled = true;
   statusPill.textContent = mode ? mode.toUpperCase() : "RUNNING";
   statusPill.className = `pill running ${mode || ""}`;
   modeLabel.textContent = mode ? `MODE · ${mode.toUpperCase()}` : "";
@@ -153,9 +250,14 @@ function setRunning(mode, pid) {
 
 function setIdle() {
   isRunning = false;
-  btnAttack.disabled = false;
-  btnDefense.disabled = false;
+  currentMode = null;
+  camOverlaySection.classList.add("hidden");
+  MODE_BUTTONS.forEach((btn) => {
+    btn.disabled = false;
+  });
   btnStop.disabled = true;
+  btnHomesetOnly.disabled = false;
+  chkHomeset.disabled = false;
   statusPill.textContent = "STANDBY";
   statusPill.className = "pill idle";
   modeLabel.textContent = "—";
@@ -182,27 +284,36 @@ async function pollTelemetry() {
       feedMeta.textContent = data.mode ? `${data.mode.toUpperCase()} · live` : "live";
     }
 
+    const mode = data.mode || currentMode;
+    if (mode && mode !== currentMode) {
+      applyViewLayout(mode);
+    }
+
     const cams = data.cameras || {};
     const attn = data.attention || {};
     const warnings = data.warnings || {};
 
     setImg(camFront, cams.front);
-    if (attn.side) {
-      setImg(camSide, attn.side);
-      sideCaption.textContent = warnings.side ? "SIDE · WARNING" : "SIDE · CAM";
+    setImg(camSide, cams.side);
+
+    if (mode === "mitigation") {
+      sideCaption.textContent = warnings.side ? "SIDE · WARNING" : "SIDE";
       sideCaption.classList.toggle("warn", Boolean(warnings.side));
     } else {
-      setImg(camSide, cams.side);
       sideCaption.textContent = "SIDE";
       sideCaption.classList.remove("warn");
     }
 
-    const series = data.series || {};
-    ACTION_KEYS.forEach((key) => {
-      const chart = chartCanvases[key];
-      if (!chart) return;
-      drawSeries(chart.canvas, series[key] || [], chart.color);
-    });
+    if (mode === "detect") {
+      setImg(camFrontCam, attn.front);
+      setImg(camSideCam, attn.side);
+      frontCamCaption.textContent = "FRONT · GRAD-CAM";
+      sideCamCaption.textContent = warnings.side ? "SIDE · GRAD-CAM · WARNING" : "SIDE · GRAD-CAM";
+      sideCamCaption.classList.toggle("warn", Boolean(warnings.side));
+    }
+
+    lastSeries = data.series || {};
+    drawCombinedChart(lastSeries);
   } catch (err) {
     console.debug(err);
   }
@@ -212,7 +323,10 @@ async function pollStatus() {
   try {
     const data = await api("/api/status");
     renderLogs(data.logs || []);
-    if (data.running) {
+    updateRepoPreview(data);
+    if (data.homeset_running) {
+      setBusyHomeset(true);
+    } else if (data.running) {
       setRunning(data.mode, data.pid);
     } else {
       setIdle();
@@ -223,13 +337,38 @@ async function pollStatus() {
 }
 
 async function startMode(mode) {
+  const homeset = chkHomeset.checked;
   try {
-    const data = await api("/api/start", { mode });
-    appendTerminal(`\n>>> ${mode.toUpperCase()} session started (pid ${data.pid})\n`);
+    setBusyHomeset(true);
+    appendTerminal(
+      `\n>>> ${mode.toUpperCase()}${homeset ? " (home set first)" : ""} starting…\n`,
+    );
+    const data = await api("/api/start", { mode, homeset });
+    appendTerminal(
+      `\n>>> ${mode.toUpperCase()} started · repo ${data.repo_id} · pid ${data.pid}\n`,
+    );
+    updateRepoPreview(data);
     await pollStatus();
   } catch (err) {
     appendTerminal(`\n[ERROR] ${err.message}\n`);
     alert(err.message);
+    setIdle();
+    await pollStatus();
+  }
+}
+
+async function runHomesetOnly() {
+  try {
+    setBusyHomeset(true);
+    appendTerminal("\n>>> Running home set (moveLinear.py)…\n");
+    await api("/api/homeset", {});
+    appendTerminal("\n>>> Home set done\n");
+    await pollStatus();
+  } catch (err) {
+    appendTerminal(`\n[ERROR] ${err.message}\n`);
+    alert(err.message);
+    setIdle();
+    await pollStatus();
   }
 }
 
@@ -250,8 +389,10 @@ function appendTerminal(text) {
 }
 
 btnAttack.addEventListener("click", () => startMode("attack"));
-btnDefense.addEventListener("click", () => startMode("defense"));
+btnDetect.addEventListener("click", () => startMode("detect"));
+btnMitigation.addEventListener("click", () => startMode("mitigation"));
 btnStop.addEventListener("click", stopSession);
+btnHomesetOnly.addEventListener("click", runHomesetOnly);
 
 drawMatrix();
 initCharts();
