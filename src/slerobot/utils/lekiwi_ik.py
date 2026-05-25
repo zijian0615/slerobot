@@ -170,7 +170,12 @@ class LeKiwiQuestIK:
         ee_position_scale_mm: float = 0.001,
         max_delta_translation_m: float = 0.08,
         require_trigger: bool = True,
-        settle_frames_after_zero: int = 10,
+        settle_frames_after_zero: int = 20,
+        warmup_frames_after_settle: int = 10,
+        ramp_frames: int = 25,
+        max_joint_step_deg: float = 5.0,
+        trust_vr_app_relative_pose: bool = True,
+        resync_zero_during_settle: bool = True,
         use_degrees: bool = False,
         calibration: dict[str, MotorCalibration] | None = None,
     ) -> None:
@@ -184,6 +189,11 @@ class LeKiwiQuestIK:
         self.max_delta_translation_m = max_delta_translation_m
         self.require_trigger = require_trigger
         self.settle_frames_after_zero = settle_frames_after_zero
+        self.warmup_frames_after_settle = warmup_frames_after_settle
+        self.ramp_frames = ramp_frames
+        self.max_joint_step_deg = max_joint_step_deg
+        self.trust_vr_app_relative_pose = trust_vr_app_relative_pose
+        self.resync_zero_during_settle = resync_zero_during_settle
         self.use_degrees = use_degrees
         self.calibration = calibration or {}
 
@@ -194,6 +204,8 @@ class LeKiwiQuestIK:
         self._vr_zeroed: bool = False
         self._zero_pose: tuple[float, float, float, float, float, float] | None = None
         self._settle_frames: int = 0
+        self._warmup_frames: int = 0
+        self._ramp_frames_remaining: int = 0
         self._logged_waiting_for_enable: bool = False
         self._logged_near_zero_offset: bool = False
 
@@ -205,6 +217,8 @@ class LeKiwiQuestIK:
         self._vr_zeroed = False
         self._zero_pose = None
         self._settle_frames = 0
+        self._warmup_frames = 0
+        self._ramp_frames_remaining = 0
         self._logged_waiting_for_enable = False
         self._logged_near_zero_offset = False
 
@@ -220,14 +234,50 @@ class LeKiwiQuestIK:
         self._zero_pose = (px, py, pz, rw, rp, rr)
         self._vr_zeroed = True
         self._settle_frames = self.settle_frames_after_zero
+        self._warmup_frames = 0
+        self._ramp_frames_remaining = self.ramp_frames
         self._logged_waiting_for_enable = False
         logger.info(
-            "Quest %s — VR zero latched (x=%.1f y=%.1f z=%.1f). Hold trigger, then move.",
+            "Quest %s — teleop armed (x=%.1f y=%.1f z=%.1f). "
+            "Keep trigger held ~1s with hand still, then move slowly.",
             source,
             px,
             py,
             pz,
         )
+
+    def _sync_zero_pose(
+        self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
+    ) -> None:
+        self._zero_pose = (px, py, pz, rw, rp, rr)
+
+    def _motion_scale_multiplier(self) -> float:
+        if self.ramp_frames <= 0 or self._ramp_frames_remaining <= 0:
+            return 1.0
+        done = self.ramp_frames - self._ramp_frames_remaining
+        return min(1.0, max(0.0, done / float(self.ramp_frames)))
+
+    @staticmethod
+    def _clamp_delta_translation(t_delta: np.ndarray, max_m: float) -> np.ndarray:
+        trans = t_delta[:3, 3]
+        norm = float(np.linalg.norm(trans))
+        if norm <= max_m or norm < 1e-12:
+            return t_delta
+        out = t_delta.copy()
+        out[:3, 3] = trans * (max_m / norm)
+        return out
+
+    def _clamp_joint_deg_step(
+        self, current_deg: np.ndarray, target_deg: np.ndarray
+    ) -> np.ndarray:
+        step = float(self.max_joint_step_deg)
+        if step <= 0:
+            return target_deg
+        delta = target_deg - current_deg
+        max_abs = float(np.max(np.abs(delta)))
+        if max_abs <= step:
+            return target_deg
+        return current_deg + delta * (step / max_abs)
 
     def _update_button_edges(
         self,
@@ -273,10 +323,28 @@ class LeKiwiQuestIK:
         return px - ox, py - oy, pz - oz, rw - ow, rp - op, rr - or_
 
     def _delta_matrix_from_quest(
-        self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
+        self,
+        px: float,
+        py: float,
+        pz: float,
+        rw: float,
+        rp: float,
+        rr: float,
+        *,
+        motion_scale: float = 1.0,
     ) -> np.ndarray:
-        scale = self.quest_position_scale * self.ee_position_scale_mm
-        return fanuc_pose_to_matrix(px, py, pz, rw, rp, rr, position_scale=scale)
+        scale = self.quest_position_scale * self.ee_position_scale_mm * motion_scale
+        t_delta = fanuc_pose_to_matrix(px, py, pz, rw, rp, rr, position_scale=scale)
+        max_m = self.max_delta_translation_m * max(motion_scale, 0.05)
+        return self._clamp_delta_translation(t_delta, max_m)
+
+    def _quest_delta_for_ik(
+        self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
+    ) -> tuple[float, float, float, float, float, float]:
+        """Fanuc VR already sends A-relative offsets; optional Mac-side subtract for legacy."""
+        if self.trust_vr_app_relative_pose and self.quest_pose_mode == "relative_to_a":
+            return px, py, pz, rw, rp, rr
+        return self._quest_offsets_from_zero(px, py, pz, rw, rp, rr)
 
     def _solve_relative_to_a(
         self,
@@ -288,17 +356,20 @@ class LeKiwiQuestIK:
         rr: float,
         current_deg: np.ndarray,
     ) -> np.ndarray:
-        """Offsets relative to pose latched at A-press (handles VR zero delay)."""
-        dx, dy, dz, dw, dp, dr = self._quest_offsets_from_zero(px, py, pz, rw, rp, rr)
-        t_delta = self._delta_matrix_from_quest(dx, dy, dz, dw, dp, dr)
+        motion_scale = self._motion_scale_multiplier()
+        dx, dy, dz, dw, dp, dr = self._quest_delta_for_ik(px, py, pz, rw, rp, rr)
+        t_delta = self._delta_matrix_from_quest(
+            dx, dy, dz, dw, dp, dr, motion_scale=motion_scale
+        )
         t_current = self.kinematics.forward_kinematics(current_deg)
         t_target = t_current @ t_delta
-        return self.kinematics.inverse_kinematics(
+        target_deg = self.kinematics.inverse_kinematics(
             current_deg,
             t_target,
             position_weight=self.position_weight,
             orientation_weight=self.orientation_weight,
         )
+        return self._clamp_joint_deg_step(current_deg, target_deg)
 
     def _solve_absolute_pair(
         self,
@@ -331,12 +402,13 @@ class LeKiwiQuestIK:
 
         t_current = self.kinematics.forward_kinematics(current_deg)
         t_target = t_current @ t_delta
-        return self.kinematics.inverse_kinematics(
+        target_deg = self.kinematics.inverse_kinematics(
             current_deg,
             t_target,
             position_weight=self.position_weight,
             orientation_weight=self.orientation_weight,
         )
+        return self._clamp_joint_deg_step(current_deg, target_deg)
 
     def solve(
         self,
@@ -373,10 +445,12 @@ class LeKiwiQuestIK:
             return hold
 
         if self.quest_pose_mode == "relative_to_a" and self._vr_zeroed:
-            dx, dy, dz, dw, dp, dr = self._quest_offsets_from_zero(px, py, pz, rw, rp, rr)
+            dx, dy, dz, dw, dp, dr = self._quest_delta_for_ik(px, py, pz, rw, rp, rr)
             if (
                 not self._logged_near_zero_offset
                 and quest_trigger_pressed(quest_action)
+                and self._settle_frames == 0
+                and self._warmup_frames == 0
                 and max(abs(dx), abs(dy), abs(dz)) < 0.5
                 and max(abs(dw), abs(dp), abs(dr)) < 0.5
             ):
@@ -390,7 +464,19 @@ class LeKiwiQuestIK:
                 self._logged_near_zero_offset = True
 
         if self._settle_frames > 0:
+            if self.resync_zero_during_settle:
+                self._sync_zero_pose(px, py, pz, rw, rp, rr)
             self._settle_frames -= 1
+            if self._settle_frames == 0:
+                self._warmup_frames = self.warmup_frames_after_settle
+                if not self.trust_vr_app_relative_pose:
+                    self._sync_zero_pose(px, py, pz, rw, rp, rr)
+            return hold
+
+        if self._warmup_frames > 0:
+            if not self.trust_vr_app_relative_pose:
+                self._sync_zero_pose(px, py, pz, rw, rp, rr)
+            self._warmup_frames -= 1
             return hold
 
         if self.require_trigger and not quest_trigger_pressed(quest_action):
@@ -404,6 +490,9 @@ class LeKiwiQuestIK:
         except Exception as exc:
             logger.warning("IK failed (%s); holding current joints.", exc)
             return hold
+
+        if self._ramp_frames_remaining > 0:
+            self._ramp_frames_remaining -= 1
 
         return joint_degrees_to_arm_action(
             target_deg, self.calibration, use_degrees=self.use_degrees
