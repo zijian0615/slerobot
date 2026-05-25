@@ -34,6 +34,7 @@ from slerobot.policies.factory import get_policy_class, make_pre_post_processors
 
 from slerobot.utils.control_utils import init_keyboard_listener, is_headless, predict_action
 from slerobot.utils.lekiwi_action_debug import log_lekiwi_action_debug
+from slerobot.utils.lekiwi_ik import quest_trigger_pressed
 from slerobot.utils.robot_utils import decode_fanuc_pose_dict, encode_fanuc_pose_dict
 from slerobot.utils.utils import get_safe_torch_device, init_logging, log_say
 from slerobot.utils.live_telemetry import push_live_telemetry
@@ -392,6 +393,7 @@ def record_loop(
     target_dt = 1.0 / fps
 
     action_sent_count = 0
+    action_skipped_teleop_idle = 0
     action_skipped_buffer_full = 0
     rerun_step = 0
     last_diagnostic_time = time.perf_counter()
@@ -608,13 +610,24 @@ def record_loop(
                 observation=obs,
             )
 
-        robot.send_action(robot_action_to_send)
+        # LeKiwi: ZMQ only while Quest trigger is held (controller is master).
+        # Record loop still runs at dataset fps for obs/dataset; Pi stops recv when trigger released.
+        lekiwi_send_zmq = True
+        if robot_backend == "lekiwi":
+            lekiwi_send_zmq = bool(quest_act is not None and quest_trigger_pressed(quest_act))
+
+        if lekiwi_send_zmq:
+            robot.send_action(robot_action_to_send)
+            action_sent_count += 1
+        elif robot_backend == "lekiwi":
+            action_skipped_teleop_idle += 1
+        else:
+            robot.send_action(robot_action_to_send)
+            action_sent_count += 1
 
         if use_fanuc_backend:
             seq_id = robot.seq_id - 1
             pending.add(seq_id)
-
-        action_sent_count += 1
 
         if use_fanuc_backend and len(pending) >= BUFFER_SIZE:
             time.sleep(INTER_PACKET_DELAY)
@@ -698,7 +711,12 @@ def record_loop(
         if now - last_diagnostic_time >= diagnostic_interval_s:
             actual_fps = action_sent_count / timestamp if timestamp > 0 else 0
             pending_info = len(pending) if use_fanuc_backend else 0
-            skipped_info = action_skipped_buffer_full if use_fanuc_backend else 0
+            if use_fanuc_backend:
+                skipped_info = action_skipped_buffer_full
+            elif robot_backend == "lekiwi":
+                skipped_info = action_skipped_teleop_idle
+            else:
+                skipped_info = 0
 
             print(
                 f"[FPS] t={timestamp:.1f}s actual={actual_fps:.2f}fps target={fps} "
