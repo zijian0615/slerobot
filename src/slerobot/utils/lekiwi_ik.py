@@ -205,6 +205,7 @@ class LeKiwiQuestIK:
         self._prev_trigger_pressed: bool = False
         self._vr_zeroed: bool = False
         self._zero_pose: tuple[float, float, float, float, float, float] | None = None
+        self._neutral_fk: np.ndarray | None = None
         self._settle_frames: int = 0
         self._warmup_frames: int = 0
         self._ramp_frames_remaining: int = 0
@@ -218,6 +219,7 @@ class LeKiwiQuestIK:
         self._prev_trigger_pressed = False
         self._vr_zeroed = False
         self._zero_pose = None
+        self._neutral_fk = None
         self._settle_frames = 0
         self._warmup_frames = 0
         self._ramp_frames_remaining = 0
@@ -234,6 +236,7 @@ class LeKiwiQuestIK:
         self, px: float, py: float, pz: float, rw: float, rp: float, rr: float, *, source: str
     ) -> None:
         self._zero_pose = (px, py, pz, rw, rp, rr)
+        self._neutral_fk = None
         self._vr_zeroed = True
         self._settle_frames = self.settle_frames_after_zero
         self._warmup_frames = 0
@@ -298,7 +301,18 @@ class LeKiwiQuestIK:
 
         trigger_pressed = quest_trigger_pressed(quest_action)
         trigger_rising = trigger_pressed and not self._prev_trigger_pressed
+        trigger_falling = (not trigger_pressed) and self._prev_trigger_pressed
         self._prev_trigger_pressed = trigger_pressed
+
+        if trigger_falling and self.quest_pose_mode == "relative_to_a" and self._vr_zeroed:
+            self._vr_zeroed = False
+            self._zero_pose = None
+            self._neutral_fk = None
+            self._settle_frames = 0
+            self._warmup_frames = 0
+            self._ramp_frames_remaining = 0
+            self._logged_near_zero_offset = False
+            logger.info("Quest trigger released — arm teleop disarmed (hold current pose).")
 
         if (a_rising or trigger_rising) and self.quest_pose_mode == "relative_to_a":
             source = "A" if a_rising else "trigger"
@@ -376,8 +390,12 @@ class LeKiwiQuestIK:
         t_delta = self._delta_matrix_from_quest(
             dx, dy, dz, dw, dp, dr, motion_scale=motion_scale
         )
-        t_current = self.kinematics.forward_kinematics(current_deg)
-        t_target = t_current @ t_delta
+        if self._neutral_fk is not None:
+            # Target fixed in space from neutral lock — constant delta does not crawl frame-by-frame.
+            t_target = self._neutral_fk @ t_delta
+        else:
+            t_current = self.kinematics.forward_kinematics(current_deg)
+            t_target = t_current @ t_delta
         target_deg = self.kinematics.inverse_kinematics(
             current_deg,
             t_target,
@@ -472,6 +490,8 @@ class LeKiwiQuestIK:
             self._warmup_frames -= 1
             if self._warmup_frames == 0:
                 self._ramp_frames_remaining = self.ramp_frames
+                self._neutral_fk = self.kinematics.forward_kinematics(current_deg)
+                self._logged_near_zero_offset = False
                 logger.info(
                     "Teleop neutral locked (x=%.1f y=%.1f z=%.1f) — move hand only after this.",
                     px,
