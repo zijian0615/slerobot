@@ -17,6 +17,7 @@
 import base64
 import json
 import logging
+import time
 from functools import cached_property
 from typing import Any
 
@@ -68,6 +69,9 @@ class LeKiwiClient(Robot):
 
         self._is_connected = False
         self.logs = {}
+        self._last_obs_received_t: float | None = None
+        self._last_obs_stale_warn_t: float = 0.0
+        self._connect_t: float | None = None
 
     @cached_property
     def _state_ft(self) -> dict[str, type]:
@@ -137,6 +141,8 @@ class LeKiwiClient(Robot):
             raise DeviceNotConnectedError("Timeout waiting for LeKiwi Host to connect expired.")
 
         self._is_connected = True
+        self._connect_t = time.perf_counter()
+        self._last_obs_received_t = time.perf_counter()
 
     def calibrate(self) -> None:
         pass
@@ -154,7 +160,20 @@ class LeKiwiClient(Robot):
             return None
 
         if self.zmq_observation_socket not in socks:
-            logging.info("No new data available within timeout.")
+            logging.debug("No new ZMQ observation within %sms.", self.polling_timeout_ms)
+            now = time.perf_counter()
+            ref_t = self._last_obs_received_t or self._connect_t or now
+            stale_for = now - ref_t
+            if stale_for > 2.0 and (now - self._last_obs_stale_warn_t) > 2.0:
+                logging.warning(
+                    "No observations from LeKiwi host at %s:%s for %.1fs — "
+                    "is `lekiwi_host` running on the Pi? (cameras slow ~5fps is normal; "
+                    "use cached state until next frame)",
+                    self.remote_ip,
+                    self.port_zmq_observations,
+                    stale_for,
+                )
+                self._last_obs_stale_warn_t = now
             return None
 
         last_msg = None
@@ -167,6 +186,8 @@ class LeKiwiClient(Robot):
 
         if last_msg is None:
             logging.warning("Poller indicated data, but failed to retrieve message.")
+        else:
+            self._last_obs_received_t = time.perf_counter()
 
         return last_msg
 

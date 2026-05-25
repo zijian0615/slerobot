@@ -104,5 +104,5 @@ class LeKiwiClientConfig(RobotConfig):
 
     cameras: dict[str, CameraConfig] = field(default_factory=lekiwi_cameras_config)
 
-    polling_timeout_ms: int = 15
-    connect_timeout_s: int = 5
+    polling_timeout_ms: int = 100
+    connect_timeout_s: int = 10

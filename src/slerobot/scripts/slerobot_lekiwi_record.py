@@ -51,8 +51,8 @@ class LeKiwiRobotRecordConfig:
     remote_ip: str = "127.0.0.1"
     port_zmq_cmd: int = 5555
     port_zmq_observations: int = 5556
-    polling_timeout_ms: int = 15
-    connect_timeout_s: int = 5
+    polling_timeout_ms: int = 100
+    connect_timeout_s: int = 10
     id: str = "lekiwi_client"
 
     def to_client_config(self) -> LeKiwiClientConfig:
@@ -144,6 +144,12 @@ def record(cfg: LeKiwiRecordConfig) -> sLerobotDataset:
                 encoder_threads=cfg.dataset.encoder_threads,
             )
 
+        logging.info(
+            "Connecting LeKiwi client -> tcp://%s:%s (cmd) / :%s (obs)",
+            client_cfg.remote_ip,
+            client_cfg.port_zmq_cmd,
+            client_cfg.port_zmq_observations,
+        )
         robot.connect()
         teleop_quest.connect()
         teleop_keyboard.connect()
