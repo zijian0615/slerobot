@@ -12,7 +12,8 @@ python -m slerobot.scripts.slerobot_lekiwi_record \
 
 # Pi: python -m slerobot.robots.lekiwi.lekiwi_host --no-cameras
 # Mac IK: pip install -e ".[kinematics]"
-# Copy Pi calibration -> .../calibration/robots/lekiwi_client/lekiwi_client.json
+# Arm: press A once, hold trigger, move hand (Fanuc VR offsets)
+# Tune: --position_scale=0.7  --quest_axis_remap=z,-x,y  (try x,y,z if axes feel wrong)
 ```
 """
 
@@ -94,13 +95,15 @@ class LeKiwiRecordConfig:
     mqtt_broker: str = "10.22.9.10"
     mqtt_port: int = 1883
     mqtt_topic: str = "quest/data"
-    position_scale: float = 0.5
-    orientation_weight: float = 0.05
-    max_joint_step_deg: float = 5.0
-    quest_delta_ema_alpha: float = 0.55
-    joint_output_alpha: float = 0.4
-    position_deadzone_mm: float = 1.5
-    rotation_deadzone_deg: float = 1.5
+    quest_pose_mode: str = "vr_offset"
+    quest_axis_remap: str = "z,-x,y"
+    position_scale: float = 1.0
+    orientation_weight: float = 0.15
+    max_joint_step_deg: float = 12.0
+    quest_delta_ema_alpha: float = 0.85
+    joint_output_alpha: float = 0.9
+    position_deadzone_mm: float = 0.5
+    rotation_deadzone_deg: float = 0.8
     display_data: bool = False
     display_ip: str | None = None
     display_port: int | None = None
@@ -113,6 +116,8 @@ class LeKiwiRecordConfig:
 def _make_quest_mapper(cfg: LeKiwiRecordConfig) -> LeKiwiQuestMapper:
     return LeKiwiQuestMapper(
         config=LeKiwiQuestMapperConfig(
+            quest_pose_mode=cfg.quest_pose_mode,
+            quest_axis_remap=cfg.quest_axis_remap,
             quest_position_scale=cfg.position_scale,
             orientation_weight=cfg.orientation_weight,
             max_joint_step_deg=cfg.max_joint_step_deg,

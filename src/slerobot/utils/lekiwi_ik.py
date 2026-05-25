@@ -75,6 +75,36 @@ def fanuc_pose_to_matrix(
     return t
 
 
+def parse_quest_axis_remap(spec: str) -> np.ndarray:
+    """Map Quest (px,py,pz) mm to robot-base axes, e.g. ``z,-x,y`` (LeKiwi default)."""
+    axes = {"x": 0, "y": 1, "z": 2}
+    mat = np.zeros((3, 3), dtype=float)
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    if len(parts) != 3:
+        raise ValueError(f"quest_axis_remap must have 3 comma-separated axes, got {spec!r}")
+    for out_i, token in enumerate(parts):
+        sign = -1.0 if token.startswith("-") else 1.0
+        axis = token.lstrip("+-").lower()
+        if axis not in axes:
+            raise ValueError(f"Invalid axis {axis!r} in quest_axis_remap {spec!r}")
+        mat[out_i, axes[axis]] = sign
+    return mat
+
+
+def remap_quest_translation_mm(
+    dx_mm: float, dy_mm: float, dz_mm: float, axis_remap: np.ndarray
+) -> tuple[float, float, float]:
+    v = axis_remap @ np.array([dx_mm, dy_mm, dz_mm], dtype=float)
+    return float(v[0]), float(v[1]), float(v[2])
+
+
+def _clamp_translation_vec(trans: np.ndarray, max_m: float) -> np.ndarray:
+    norm = float(np.linalg.norm(trans))
+    if norm <= max_m or norm < 1e-12:
+        return trans
+    return trans * (max_m / norm)
+
+
 def normalized_pos_to_degrees(
     norm: float,
     calibration: MotorCalibration | None,
@@ -170,43 +200,48 @@ def quest_trigger_pressed(quest_action: dict[str, Any]) -> bool:
     return bool(int(quest_action.get("triggerButton", 0)))
 
 
-QuestPoseMode = Literal["relative_to_a", "absolute_pair"]
+QuestPoseMode = Literal["vr_offset", "local_zero", "relative_to_a", "absolute_pair"]
 
 
 class LeKiwiQuestIK:
     """Map Quest EE commands to joint targets via placo IK.
 
-    ``relative_to_a`` (default, Fanuc VR app): MQTT x,y,z,w,p,r are already offsets from
-    the last A-button zero — do not subtract a second reference frame.
-    ``absolute_pair``: legacy mode, delta between latched reference pose and current pose.
+    ``vr_offset`` (default): Fanuc VR MQTT x,y,z,w,p,r are already offsets from A-button
+    zero — use them directly (no second subtraction). Deltas apply in robot-base/world frame.
+    ``local_zero`` / ``relative_to_a``: subtract a latched hand pose (slower, for non-Fanuc apps).
+    ``absolute_pair``: legacy delta between two absolute poses.
     """
 
     def __init__(
         self,
         urdf_path: str | Path | None = None,
         *,
-        quest_pose_mode: QuestPoseMode = "relative_to_a",
+        quest_pose_mode: QuestPoseMode = "vr_offset",
+        quest_axis_remap: str = "z,-x,y",
         position_weight: float = 1.0,
-        orientation_weight: float = 0.05,
-        quest_position_scale: float = 0.5,
+        orientation_weight: float = 0.15,
+        quest_position_scale: float = 1.0,
         ee_position_scale_mm: float = 0.001,
-        max_delta_translation_m: float = 0.08,
+        max_delta_translation_m: float = 0.15,
         require_trigger: bool = True,
-        settle_frames_after_zero: int = 20,
-        warmup_frames_after_settle: int = 10,
+        settle_frames_after_zero: int = 3,
+        warmup_frames_after_settle: int = 2,
         ramp_frames: int = 0,
-        max_joint_step_deg: float = 5.0,
-        position_deadzone_mm: float = 1.5,
-        rotation_deadzone_deg: float = 1.5,
-        quest_delta_ema_alpha: float = 0.55,
-        joint_output_alpha: float = 0.4,
+        max_joint_step_deg: float = 12.0,
+        position_deadzone_mm: float = 0.5,
+        rotation_deadzone_deg: float = 0.8,
+        quest_delta_ema_alpha: float = 0.85,
+        joint_output_alpha: float = 0.9,
         resync_zero_during_settle: bool = True,
         use_degrees: bool = False,
         calibration: dict[str, MotorCalibration] | None = None,
     ) -> None:
         path = Path(urdf_path) if urdf_path else default_so101_urdf_path()
         self.kinematics = RobotKinematics(path, joint_names=list(SO101_ARM_JOINT_NAMES))
+        if quest_pose_mode == "relative_to_a":
+            quest_pose_mode = "local_zero"
         self.quest_pose_mode = quest_pose_mode
+        self._axis_remap = parse_quest_axis_remap(quest_axis_remap)
         self.position_weight = position_weight
         self.orientation_weight = orientation_weight
         self.quest_position_scale = quest_position_scale
@@ -264,6 +299,24 @@ class LeKiwiQuestIK:
         self._ref_position = (px, py, pz)
         self._ref_orientation = (rw, rp, rr)
 
+    def _latch_vr_offset_arm(self, *, source: str) -> None:
+        """Fanuc VR: MQTT already reports offsets — lock robot neutral on next IK frame."""
+        self._zero_pose = None
+        self._neutral_fk = None
+        self._neutral_joint_deg = None
+        self._filtered_delta = None
+        self._last_target_deg = None
+        self._vr_zeroed = True
+        self._settle_frames = 0
+        self._warmup_frames = 0
+        self._ramp_frames_remaining = 0
+        self._logged_waiting_for_enable = False
+        logger.info(
+            "Quest %s — arm teleop armed (vr_offset). Hold trigger and move; "
+            "robot neutral locks to current pose.",
+            source,
+        )
+
     def _latch_vr_zero(
         self, px: float, py: float, pz: float, rw: float, rp: float, rr: float, *, source: str
     ) -> None:
@@ -278,12 +331,8 @@ class LeKiwiQuestIK:
         self._ramp_frames_remaining = 0
         self._logged_waiting_for_enable = False
         logger.info(
-            "Quest %s — teleop arming (x=%.1f y=%.1f z=%.1f). "
-            "Keep trigger held ~1s with hand still (neutral will lock), then move.",
+            "Quest %s — teleop arming (local_zero). Keep hand still briefly, then move.",
             source,
-            px,
-            py,
-            pz,
         )
 
     def _sync_zero_pose(
@@ -322,16 +371,13 @@ class LeKiwiQuestIK:
     def _smooth_joint_target(
         self, raw_target_deg: np.ndarray, current_deg: np.ndarray
     ) -> np.ndarray:
-        """Limit step from last command (not noisy obs), then EMA — reduces pan jitter."""
-        base = (
-            self._last_target_deg
-            if self._last_target_deg is not None
-            else current_deg
+        base = current_deg if self.joint_output_alpha >= 0.85 else (
+            self._last_target_deg if self._last_target_deg is not None else current_deg
         )
         stepped = self._clamp_joint_deg_step(base, raw_target_deg)
-        if self._last_target_deg is None:
-            return stepped
         a = float(self.joint_output_alpha)
+        if self._last_target_deg is None or a >= 0.999:
+            return stepped
         return a * stepped + (1.0 - a) * self._last_target_deg
 
     def _update_button_edges(
@@ -354,7 +400,7 @@ class LeKiwiQuestIK:
         trigger_falling = (not trigger_pressed) and self._prev_trigger_pressed
         self._prev_trigger_pressed = trigger_pressed
 
-        if trigger_falling and self.quest_pose_mode == "relative_to_a" and self._vr_zeroed:
+        if trigger_falling and self.quest_pose_mode in ("vr_offset", "local_zero") and self._vr_zeroed:
             self._vr_zeroed = False
             self._zero_pose = None
             self._neutral_fk = None
@@ -367,11 +413,14 @@ class LeKiwiQuestIK:
             self._logged_near_zero_offset = False
             logger.info("Quest trigger released — arm teleop disarmed (hold current pose).")
 
-        if (a_rising or trigger_rising) and self.quest_pose_mode == "relative_to_a":
+        if (a_rising or trigger_rising) and self.quest_pose_mode in ("vr_offset", "local_zero"):
             source = "A" if a_rising else "trigger"
             if a_rising and trigger_rising:
                 source = "A+trigger"
-            self._latch_vr_zero(px, py, pz, rw, rp, rr, source=source)
+            if self.quest_pose_mode == "vr_offset":
+                self._latch_vr_offset_arm(source=source)
+            else:
+                self._latch_vr_zero(px, py, pz, rw, rp, rr, source=source)
             self._logged_near_zero_offset = False
             return True
 
@@ -402,16 +451,48 @@ class LeKiwiQuestIK:
         *,
         motion_scale: float = 1.0,
     ) -> np.ndarray:
+        mx, my, mz = remap_quest_translation_mm(px, py, pz, self._axis_remap)
         scale = self.quest_position_scale * self.ee_position_scale_mm * motion_scale
-        t_delta = fanuc_pose_to_matrix(px, py, pz, rw, rp, rr, position_scale=scale)
+        t_delta = fanuc_pose_to_matrix(mx, my, mz, rw, rp, rr, position_scale=scale)
         max_m = self.max_delta_translation_m * max(motion_scale, 0.05)
         return self._clamp_delta_translation(t_delta, max_m)
+
+    def _target_from_delta_world(
+        self,
+        neutral_T: np.ndarray,
+        dx: float,
+        dy: float,
+        dz: float,
+        dw: float,
+        dp: float,
+        dr: float,
+    ) -> np.ndarray:
+        """Apply Fanuc-style offset in robot-base frame (matches Fanuc VR teleop)."""
+        mx, my, mz = remap_quest_translation_mm(dx, dy, dz, self._axis_remap)
+        scale = self.quest_position_scale * self.ee_position_scale_mm
+        trans = _clamp_translation_vec(
+            np.array([mx, my, mz], dtype=float) * scale,
+            self.max_delta_translation_m,
+        )
+        R_delta = wpr_deg_to_rotation_matrix(dw, dp, dr)
+        out = neutral_T.copy()
+        out[:3, :3] = R_delta @ neutral_T[:3, :3]
+        out[:3, 3] = neutral_T[:3, 3] + trans
+        return out
+
+    def _ensure_neutral_locked(self, current_deg: np.ndarray) -> None:
+        if self._neutral_fk is not None:
+            return
+        self._neutral_fk = self.kinematics.forward_kinematics(current_deg)
+        self._neutral_joint_deg = current_deg.copy()
+        self._last_target_deg = current_deg.copy()
+        self._filtered_delta = None
+        logger.info("Teleop neutral locked to current arm pose.")
 
     def _quest_delta_for_ik(
         self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
     ) -> tuple[float, float, float, float, float, float]:
-        """Delta vs pose frozen at end of settle+warmup (hand still → ~0 command)."""
-        if self.quest_pose_mode == "relative_to_a":
+        if self.quest_pose_mode == "local_zero":
             return self._quest_offsets_from_zero(px, py, pz, rw, rp, rr)
         return px, py, pz, rw, rp, rr
 
@@ -423,12 +504,13 @@ class LeKiwiQuestIK:
     def _quest_smoothed_delta_for_ik(
         self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
     ) -> tuple[float, float, float, float, float, float]:
-        """EMA-smoothed offset from neutral (responsive, filters MQTT jitter)."""
         raw = self._quest_delta_for_ik(px, py, pz, rw, rp, rr)
+        a = float(self.quest_delta_ema_alpha)
+        if a >= 0.999:
+            return raw
         if self._filtered_delta is None:
             self._filtered_delta = raw
             return raw
-        a = float(self.quest_delta_ema_alpha)
         prev = self._filtered_delta
         smoothed = tuple(a * r + (1.0 - a) * p for r, p in zip(raw, prev))
         self._filtered_delta = smoothed
@@ -447,7 +529,7 @@ class LeKiwiQuestIK:
         rot = max(abs(dw), abs(dp), abs(dr))
         return pos < self.position_deadzone_mm and rot < self.rotation_deadzone_deg
 
-    def _solve_relative_to_a(
+    def _solve_delta_ik(
         self,
         px: float,
         py: float,
@@ -457,25 +539,24 @@ class LeKiwiQuestIK:
         rr: float,
         current_deg: np.ndarray,
     ) -> np.ndarray:
+        self._ensure_neutral_locked(current_deg)
+        assert self._neutral_fk is not None
+
         dx, dy, dz, dw, dp, dr = self._quest_smoothed_delta_for_ik(px, py, pz, rw, rp, rr)
         if self._pose_delta_below_deadzone(dx, dy, dz, dw, dp, dr):
             if self._last_target_deg is not None:
                 return self._last_target_deg.copy()
             return current_deg
 
-        t_delta = self._delta_matrix_from_quest(dx, dy, dz, dw, dp, dr, motion_scale=1.0)
-        if self._neutral_fk is not None:
+        if self.quest_pose_mode == "vr_offset":
+            t_target = self._target_from_delta_world(
+                self._neutral_fk, dx, dy, dz, dw, dp, dr
+            )
+        else:
+            t_delta = self._delta_matrix_from_quest(dx, dy, dz, dw, dp, dr, motion_scale=1.0)
             t_target = self._neutral_fk @ t_delta
-        else:
-            t_current = self.kinematics.forward_kinematics(current_deg)
-            t_target = t_current @ t_delta
 
-        if self._last_target_deg is not None:
-            ik_seed = self._last_target_deg
-        elif self._neutral_joint_deg is not None:
-            ik_seed = self._neutral_joint_deg
-        else:
-            ik_seed = current_deg
+        ik_seed = current_deg
         raw_target = self.kinematics.inverse_kinematics(
             ik_seed,
             t_target,
@@ -550,7 +631,7 @@ class LeKiwiQuestIK:
         if self._update_button_edges(quest_action, px, py, pz, rw, rp, rr):
             return hold
 
-        if self.quest_pose_mode == "relative_to_a" and not self._vr_zeroed:
+        if self.quest_pose_mode in ("vr_offset", "local_zero") and not self._vr_zeroed:
             if not self._logged_waiting_for_enable:
                 logger.info(
                     "Arm teleop idle — press Quest A (in VR) then squeeze trigger once "
@@ -559,38 +640,34 @@ class LeKiwiQuestIK:
                 self._logged_waiting_for_enable = True
             return hold
 
-        if self._settle_frames > 0:
-            if self.resync_zero_during_settle:
-                self._sync_zero_pose(px, py, pz, rw, rp, rr)
-            self._settle_frames -= 1
-            if self._settle_frames == 0:
-                self._warmup_frames = self.warmup_frames_after_settle
-            return hold
+        if self.quest_pose_mode == "local_zero":
+            if self._settle_frames > 0:
+                if self.resync_zero_during_settle:
+                    self._sync_zero_pose(px, py, pz, rw, rp, rr)
+                self._settle_frames -= 1
+                if self._settle_frames == 0:
+                    self._warmup_frames = self.warmup_frames_after_settle
+                return hold
 
-        if self._warmup_frames > 0:
-            self._sync_zero_pose(px, py, pz, rw, rp, rr)
-            self._warmup_frames -= 1
-            if self._warmup_frames == 0:
-                self._ramp_frames_remaining = self.ramp_frames
-                self._neutral_fk = self.kinematics.forward_kinematics(current_deg)
-                self._neutral_joint_deg = current_deg.copy()
-                self._reset_delta_tracking(px, py, pz, rw, rp, rr)
-                self._last_target_deg = current_deg.copy()
-                self._logged_near_zero_offset = False
-                logger.info(
-                    "Teleop neutral locked (x=%.1f y=%.1f z=%.1f) — move hand only after this.",
-                    px,
-                    py,
-                    pz,
-                )
-            return hold
+            if self._warmup_frames > 0:
+                self._sync_zero_pose(px, py, pz, rw, rp, rr)
+                self._warmup_frames -= 1
+                if self._warmup_frames == 0:
+                    self._ramp_frames_remaining = self.ramp_frames
+                    self._neutral_fk = self.kinematics.forward_kinematics(current_deg)
+                    self._neutral_joint_deg = current_deg.copy()
+                    self._reset_delta_tracking(px, py, pz, rw, rp, rr)
+                    self._last_target_deg = current_deg.copy()
+                    self._logged_near_zero_offset = False
+                    logger.info("Teleop neutral locked (local_zero) — move hand now.")
+                return hold
 
         if self.require_trigger and not quest_trigger_pressed(quest_action):
             return hold
 
         try:
-            if self.quest_pose_mode == "relative_to_a":
-                target_deg = self._solve_relative_to_a(px, py, pz, rw, rp, rr, current_deg)
+            if self.quest_pose_mode in ("vr_offset", "local_zero"):
+                target_deg = self._solve_delta_ik(px, py, pz, rw, rp, rr, current_deg)
             else:
                 target_deg = self._solve_absolute_pair(px, py, pz, rw, rp, rr, current_deg)
         except Exception as exc:

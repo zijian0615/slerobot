@@ -20,23 +20,24 @@ class LeKiwiQuestMapperConfig:
 
     use_ik: bool = True
     urdf_path: str | None = None
-    # Fanuc VR: x,y,z,w,p,r are offsets from A-button zero (not absolute cell pose).
-    quest_pose_mode: str = "relative_to_a"
+    # Fanuc VR MQTT: offsets from A-button zero (see ``vr_offset`` in lekiwi_ik).
+    quest_pose_mode: str = "vr_offset"
+    quest_axis_remap: str = "z,-x,y"
     use_degrees: bool = False
-    quest_position_scale: float = 0.5
+    quest_position_scale: float = 1.0
     ee_position_scale_mm: float = 0.001
     position_weight: float = 1.0
-    orientation_weight: float = 0.05
-    max_delta_translation_m: float = 0.12
+    orientation_weight: float = 0.15
+    max_delta_translation_m: float = 0.15
     require_trigger: bool = True
-    settle_frames_after_zero: int = 20
-    warmup_frames_after_settle: int = 10
+    settle_frames_after_zero: int = 3
+    warmup_frames_after_settle: int = 2
     ramp_frames: int = 0
-    max_joint_step_deg: float = 5.0
-    position_deadzone_mm: float = 1.5
-    rotation_deadzone_deg: float = 1.5
-    quest_delta_ema_alpha: float = 0.55
-    joint_output_alpha: float = 0.4
+    max_joint_step_deg: float = 12.0
+    position_deadzone_mm: float = 0.5
+    rotation_deadzone_deg: float = 0.8
+    quest_delta_ema_alpha: float = 0.85
+    joint_output_alpha: float = 0.9
     resync_zero_during_settle: bool = True
     gripper_open: float = 0.0
     gripper_closed: float = 100.0
@@ -152,6 +153,7 @@ class LeKiwiQuestMapper:
             self._ik = LeKiwiQuestIK(
                 urdf,
                 quest_pose_mode=self.config.quest_pose_mode,  # type: ignore[arg-type]
+                quest_axis_remap=self.config.quest_axis_remap,
                 position_weight=self.config.position_weight,
                 orientation_weight=self.config.orientation_weight,
                 max_delta_translation_m=self.config.max_delta_translation_m,
