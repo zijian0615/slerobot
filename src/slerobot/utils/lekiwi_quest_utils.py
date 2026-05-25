@@ -33,7 +33,8 @@ class LeKiwiQuestMapperConfig:
     warmup_frames_after_settle: int = 10
     ramp_frames: int = 25
     max_joint_step_deg: float = 5.0
-    trust_vr_app_relative_pose: bool = True
+    position_deadzone_mm: float = 3.0
+    rotation_deadzone_deg: float = 2.0
     resync_zero_during_settle: bool = True
     gripper_open: float = 0.0
     gripper_closed: float = 100.0
@@ -157,7 +158,8 @@ class LeKiwiQuestMapper:
                 warmup_frames_after_settle=self.config.warmup_frames_after_settle,
                 ramp_frames=self.config.ramp_frames,
                 max_joint_step_deg=self.config.max_joint_step_deg,
-                trust_vr_app_relative_pose=self.config.trust_vr_app_relative_pose,
+                position_deadzone_mm=self.config.position_deadzone_mm,
+                rotation_deadzone_deg=self.config.rotation_deadzone_deg,
                 resync_zero_during_settle=self.config.resync_zero_during_settle,
                 quest_position_scale=self.config.quest_position_scale,
                 ee_position_scale_mm=self.config.ee_position_scale_mm,

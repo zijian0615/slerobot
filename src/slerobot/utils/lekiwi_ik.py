@@ -174,7 +174,8 @@ class LeKiwiQuestIK:
         warmup_frames_after_settle: int = 10,
         ramp_frames: int = 25,
         max_joint_step_deg: float = 5.0,
-        trust_vr_app_relative_pose: bool = True,
+        position_deadzone_mm: float = 3.0,
+        rotation_deadzone_deg: float = 2.0,
         resync_zero_during_settle: bool = True,
         use_degrees: bool = False,
         calibration: dict[str, MotorCalibration] | None = None,
@@ -192,7 +193,8 @@ class LeKiwiQuestIK:
         self.warmup_frames_after_settle = warmup_frames_after_settle
         self.ramp_frames = ramp_frames
         self.max_joint_step_deg = max_joint_step_deg
-        self.trust_vr_app_relative_pose = trust_vr_app_relative_pose
+        self.position_deadzone_mm = position_deadzone_mm
+        self.rotation_deadzone_deg = rotation_deadzone_deg
         self.resync_zero_during_settle = resync_zero_during_settle
         self.use_degrees = use_degrees
         self.calibration = calibration or {}
@@ -235,11 +237,11 @@ class LeKiwiQuestIK:
         self._vr_zeroed = True
         self._settle_frames = self.settle_frames_after_zero
         self._warmup_frames = 0
-        self._ramp_frames_remaining = self.ramp_frames
+        self._ramp_frames_remaining = 0
         self._logged_waiting_for_enable = False
         logger.info(
-            "Quest %s — teleop armed (x=%.1f y=%.1f z=%.1f). "
-            "Keep trigger held ~1s with hand still, then move slowly.",
+            "Quest %s — teleop arming (x=%.1f y=%.1f z=%.1f). "
+            "Keep trigger held ~1s with hand still (neutral will lock), then move.",
             source,
             px,
             py,
@@ -341,10 +343,23 @@ class LeKiwiQuestIK:
     def _quest_delta_for_ik(
         self, px: float, py: float, pz: float, rw: float, rp: float, rr: float
     ) -> tuple[float, float, float, float, float, float]:
-        """Fanuc VR already sends A-relative offsets; optional Mac-side subtract for legacy."""
-        if self.trust_vr_app_relative_pose and self.quest_pose_mode == "relative_to_a":
-            return px, py, pz, rw, rp, rr
-        return self._quest_offsets_from_zero(px, py, pz, rw, rp, rr)
+        """Delta vs pose frozen at end of settle+warmup (hand still → ~0 command)."""
+        if self.quest_pose_mode == "relative_to_a":
+            return self._quest_offsets_from_zero(px, py, pz, rw, rp, rr)
+        return px, py, pz, rw, rp, rr
+
+    def _pose_delta_below_deadzone(
+        self,
+        dx: float,
+        dy: float,
+        dz: float,
+        dw: float,
+        dp: float,
+        dr: float,
+    ) -> bool:
+        pos = max(abs(dx), abs(dy), abs(dz))
+        rot = max(abs(dw), abs(dp), abs(dr))
+        return pos < self.position_deadzone_mm and rot < self.rotation_deadzone_deg
 
     def _solve_relative_to_a(
         self,
@@ -469,17 +484,26 @@ class LeKiwiQuestIK:
             self._settle_frames -= 1
             if self._settle_frames == 0:
                 self._warmup_frames = self.warmup_frames_after_settle
-                if not self.trust_vr_app_relative_pose:
-                    self._sync_zero_pose(px, py, pz, rw, rp, rr)
             return hold
 
         if self._warmup_frames > 0:
-            if not self.trust_vr_app_relative_pose:
-                self._sync_zero_pose(px, py, pz, rw, rp, rr)
+            self._sync_zero_pose(px, py, pz, rw, rp, rr)
             self._warmup_frames -= 1
+            if self._warmup_frames == 0:
+                self._ramp_frames_remaining = self.ramp_frames
+                logger.info(
+                    "Teleop neutral locked (x=%.1f y=%.1f z=%.1f) — move hand only after this.",
+                    px,
+                    py,
+                    pz,
+                )
             return hold
 
         if self.require_trigger and not quest_trigger_pressed(quest_action):
+            return hold
+
+        dx, dy, dz, dw, dp, dr = self._quest_delta_for_ik(px, py, pz, rw, rp, rr)
+        if self._pose_delta_below_deadzone(dx, dy, dz, dw, dp, dr):
             return hold
 
         try:
