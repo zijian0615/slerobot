@@ -201,10 +201,13 @@ class Quest3sController(Teleoperator):
                 )),
             },
         }
-        # Pass through extra button fields for debug visibility
+        # Pass through extra button and quaternion fields
         for key in ("secondaryButton", "primaryButton"):
             if key in payload:
                 result[key] = payload[key]
+        for key in ("qx", "qy", "qz", "qw"):
+            if key in payload:
+                result[key] = float(payload[key])
         for key in (
             "joystickX",
             "joystickY",

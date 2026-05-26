@@ -25,6 +25,54 @@ ARM_GRIPPER_KEY = "arm_gripper.pos"
 STS3215_MAX_RES = 4095
 
 
+# ── Quaternion helpers ─────────────────────────────────────────────────────────
+
+def _q_normalize(q: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(q))
+    return q / n if n > 1e-10 else q
+
+
+def _q_conjugate(q: np.ndarray) -> np.ndarray:
+    """Conjugate of unit quaternion [x, y, z, w]."""
+    return np.array([-q[0], -q[1], -q[2], q[3]], dtype=float)
+
+
+def _q_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Hamilton product, [x, y, z, w] convention."""
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return np.array([
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+    ], dtype=float)
+
+
+def _q_to_mat3(q: np.ndarray) -> np.ndarray:
+    """3×3 rotation matrix from unit quaternion [x, y, z, w]."""
+    q = _q_normalize(q)
+    x, y, z, w = q
+    return np.array([
+        [1 - 2*(y*y + z*z),  2*(x*y - w*z),      2*(x*z + w*y)],
+        [2*(x*y + w*z),      1 - 2*(x*x + z*z),  2*(y*z - w*x)],
+        [2*(x*z - w*y),      2*(y*z + w*x),      1 - 2*(x*x + y*y)],
+    ], dtype=float)
+
+
+def _quest_quat(quest_action: dict[str, Any]) -> np.ndarray | None:
+    """Extract [x, y, z, w] quaternion from quest_action, or None if missing."""
+    qx = quest_action.get("qx")
+    qy = quest_action.get("qy")
+    qz = quest_action.get("qz")
+    qw = quest_action.get("qw")
+    if any(v is None for v in (qx, qy, qz, qw)):
+        return None
+    q = np.array([float(qx), float(qy), float(qz), float(qw)], dtype=float)
+    n = float(np.linalg.norm(q))
+    return q / n if n > 1e-10 else None
+
+
 # ── Calibration helpers ────────────────────────────────────────────────────────
 
 def normalized_pos_to_degrees(
@@ -176,7 +224,7 @@ class _State(enum.Enum):
 
 
 class SimpleLeKiwiQuestIK:
-    """Quest position delta → LeKiwi SO-101 joint targets (position-only IK).
+    """Quest position + orientation delta → LeKiwi SO-101 joint targets via placo IK.
 
     State machine:
       IDLE  ──[A press]──>  SETTLING  ──[settle_frames elapsed]──>  ARMED
@@ -185,9 +233,10 @@ class SimpleLeKiwiQuestIK:
                                                            trigger released → freeze
                                                            A press → re-zero (→ SETTLING)
 
-    The target EE position is always ``neutral_ee_pos + remap(quest_pos - quest_zero)``,
-    computed in the robot base frame.  This guarantees no drift: releasing and
-    re-squeezing the trigger never moves the arm.
+    Position: target = neutral_ee_pos + remap(quest_pos - quest_zero) in base frame.
+    Orientation: target = R_delta_remapped @ neutral_ee_rot, where R_delta is the
+    relative rotation from the Quest quaternion at arm time.
+    Set orientation_weight=0 to disable rotation tracking.
     """
 
     def __init__(
@@ -196,6 +245,7 @@ class SimpleLeKiwiQuestIK:
         *,
         quest_axis_remap: str = "z,-x,y",
         position_scale: float = 1.0,
+        orientation_weight: float = 0.3,
         max_delta_m: float = 0.12,
         settle_frames: int = 12,
         max_joint_step_deg: float = 8.0,
@@ -208,6 +258,7 @@ class SimpleLeKiwiQuestIK:
         self.kinematics = RobotKinematics(path, joint_names=list(SO101_ARM_JOINT_NAMES))
         self._remap = parse_quest_axis_remap(quest_axis_remap)
         self.position_scale = position_scale
+        self.orientation_weight = orientation_weight
         self.max_delta_m = max_delta_m
         self.settle_frames = settle_frames
         self.max_joint_step_deg = max_joint_step_deg
@@ -218,10 +269,12 @@ class SimpleLeKiwiQuestIK:
 
         self._state: _State = _State.IDLE
         self._quest_zero: np.ndarray | None = None   # (3,) mm — Quest pos at arm time
+        self._q_zero: np.ndarray | None = None       # (4,) [x,y,z,w] — Quest quat at arm time
         self._neutral_T: np.ndarray | None = None    # (4,4) robot EE FK at arm time
         self._neutral_joints: np.ndarray | None = None
         self._last_joints: np.ndarray | None = None  # last *commanded* joints
         self._settle_buf: list[np.ndarray] = []
+        self._settle_qbuf: list[np.ndarray] = []     # quaternion settle buffer
         self._prev_a: bool = False
         self._prev_trigger: bool = False
         self._logged_idle: bool = False
@@ -230,10 +283,12 @@ class SimpleLeKiwiQuestIK:
     def reset(self) -> None:
         self._state = _State.IDLE
         self._quest_zero = None
+        self._q_zero = None
         self._neutral_T = None
         self._neutral_joints = None
         self._last_joints = None
         self._settle_buf.clear()
+        self._settle_qbuf.clear()
         self._prev_a = False
         self._prev_trigger = False
         self._logged_idle = False
@@ -296,6 +351,7 @@ class SimpleLeKiwiQuestIK:
         if a_rising:
             self._state = _State.SETTLING
             self._settle_buf.clear()
+            self._settle_qbuf.clear()
             self._last_joints = current_joints.copy()
             self._logged_idle = False
             logger.info(
@@ -308,14 +364,23 @@ class SimpleLeKiwiQuestIK:
         # ── SETTLING ─────────────────────────────────────────────────────
         if self._state == _State.SETTLING:
             self._settle_buf.append(q_pos.copy())
+            q_now = _quest_quat(quest_action)
+            if q_now is not None:
+                self._settle_qbuf.append(q_now)
             if len(self._settle_buf) >= self.settle_frames:
                 # Lock Quest zero and robot FK at the same instant
                 self._quest_zero = np.mean(self._settle_buf, axis=0)
+                if self._settle_qbuf:
+                    q_avg = np.mean(self._settle_qbuf, axis=0)
+                    self._q_zero = _q_normalize(q_avg)
+                else:
+                    self._q_zero = None
                 self._neutral_T = self.kinematics.forward_kinematics(current_joints)
                 self._neutral_joints = current_joints.copy()
                 self._last_joints = current_joints.copy()
                 self._state = _State.ARMED
                 self._settle_buf.clear()
+                self._settle_qbuf.clear()
                 logger.info(
                     "Teleop ARMED — quest_zero=(%.1f, %.1f, %.1f) mm | "
                     "neutral_ee=(%.3f, %.3f, %.3f) m",
@@ -369,12 +434,9 @@ class SimpleLeKiwiQuestIK:
         if float(np.max(np.abs(delta_quest))) < self.deadzone_mm:
             return self._hold_last(current_joints)
 
+        # ── Position target ──────────────────────────────────────────────
         # Remap Quest/Fanuc axes → robot base frame, scale mm → m.
-        # Applied directly in the robot base frame so each Quest axis maps
-        # consistently to a robot base axis regardless of EE orientation.
         delta_base = self._remap @ delta_quest * (self.position_scale * 1e-3)
-
-        # Clamp displacement magnitude
         norm = float(np.linalg.norm(delta_base))
         if norm > self.max_delta_m:
             delta_base *= self.max_delta_m / norm
@@ -382,13 +444,27 @@ class SimpleLeKiwiQuestIK:
         target_T = self._neutral_T.copy()
         target_T[:3, 3] = self._neutral_T[:3, 3] + delta_base
 
+        # ── Orientation target ───────────────────────────────────────────
+        # Compute relative rotation from Quest quaternion since arm time.
+        # R_delta is in Quest world space; remap axes to robot base space:
+        #   R_robot = P @ R_quest_delta @ P^T   (P = axis-remap matrix)
+        ori_w = 0.0
+        q_now = _quest_quat(quest_action)
+        if q_now is not None and self._q_zero is not None and self.orientation_weight > 0:
+            q_delta = _q_multiply(q_now, _q_conjugate(self._q_zero))
+            R_delta_quest = _q_to_mat3(q_delta)
+            P = self._remap
+            R_delta_robot = P @ R_delta_quest @ P.T
+            target_T[:3, :3] = R_delta_robot @ self._neutral_T[:3, :3]
+            ori_w = float(self.orientation_weight)
+
         # IK — warm start from last commanded joints for smooth, consistent solutions
         try:
             raw = self.kinematics.inverse_kinematics(
                 self._last_joints,
                 target_T,
                 position_weight=1.0,
-                orientation_weight=0.0,
+                orientation_weight=ori_w,
             )
         except Exception as exc:
             logger.warning("IK failed (%s) — holding joints.", exc)
@@ -399,10 +475,10 @@ class SimpleLeKiwiQuestIK:
         self._ik_log_cnt += 1
         if self._ik_log_cnt % 20 == 1:
             logger.info(
-                "IK: quest_delta=(%.0f,%.0f,%.0f)mm → base=(%.3f,%.3f,%.3f)m "
+                "IK: quest_delta=(%.0f,%.0f,%.0f)mm ori_w=%.2f "
                 "| Δjoints=%s°",
                 *delta_quest,
-                *delta_base,
+                ori_w,
                 [round(float(v), 1) for v in (raw - self._last_joints)],
             )
 

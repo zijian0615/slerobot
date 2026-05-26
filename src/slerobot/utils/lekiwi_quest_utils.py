@@ -28,6 +28,7 @@ class LeKiwiQuestMapperConfig:
     quest_axis_remap: str = "z,-x,y"
     use_degrees: bool = False
     position_scale: float = 1.0
+    orientation_weight: float = 0.3
     max_delta_m: float = 0.12
     settle_frames: int = 12
     max_joint_step_deg: float = 8.0
@@ -148,6 +149,7 @@ class LeKiwiQuestMapper:
                 urdf,
                 quest_axis_remap=self.config.quest_axis_remap,
                 position_scale=self.config.position_scale,
+                orientation_weight=self.config.orientation_weight,
                 max_delta_m=self.config.max_delta_m,
                 settle_frames=self.config.settle_frames,
                 max_joint_step_deg=self.config.max_joint_step_deg,

@@ -98,6 +98,7 @@ class LeKiwiRecordConfig:
     mqtt_topic: str = "quest/data"
     quest_axis_remap: str = "z,-x,y"
     position_scale: float = 1.0
+    orientation_weight: float = 0.3
     max_joint_step_deg: float = 8.0
     ema_alpha: float = 0.6
     deadzone_mm: float = 3.0
@@ -116,6 +117,7 @@ def _make_quest_mapper(cfg: LeKiwiRecordConfig) -> LeKiwiQuestMapper:
         config=LeKiwiQuestMapperConfig(
             quest_axis_remap=cfg.quest_axis_remap,
             position_scale=cfg.position_scale,
+            orientation_weight=cfg.orientation_weight,
             max_joint_step_deg=cfg.max_joint_step_deg,
             ema_alpha=cfg.ema_alpha,
             deadzone_mm=cfg.deadzone_mm,
