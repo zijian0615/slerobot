@@ -188,13 +188,23 @@ class Quest3sController(Teleoperator):
                             "aButton",
                             payload.get(
                                 "buttonA",
-                                payload.get("primaryButton", payload.get("button_a", 0)),
+                                payload.get(
+                                    "primaryButton",
+                                    payload.get(
+                                        "secondaryButton",
+                                        payload.get("button_a", 0),
+                                    ),
+                                ),
                             ),
                         ),
                     ),
                 )),
             },
         }
+        # Pass through extra button fields for debug visibility
+        for key in ("secondaryButton", "primaryButton"):
+            if key in payload:
+                result[key] = payload[key]
         for key in (
             "joystickX",
             "joystickY",

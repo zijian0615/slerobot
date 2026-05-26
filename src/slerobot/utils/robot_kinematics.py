@@ -93,15 +93,17 @@ class RobotKinematics:
         desired_ee_pose: np.ndarray,
         position_weight: float = 1.0,
         orientation_weight: float = 0.05,
+        iterations: int = 8,
     ) -> np.ndarray:
         current_joint_rad = np.deg2rad(current_joint_pos[: len(self.joint_names)])
         for i, joint_name in enumerate(self.joint_names):
             self.robot.set_joint(joint_name, float(current_joint_rad[i]))
 
-        self.tip_frame.T_world_frame = desired_ee_pose
         self.tip_frame.configure(self.target_frame_name, "soft", position_weight, orientation_weight)
-        self.solver.solve(True)
-        self.robot.update_kinematics()
+        for _ in range(iterations):
+            self.tip_frame.T_world_frame = desired_ee_pose
+            self.solver.solve(True)
+            self.robot.update_kinematics()
 
         joint_pos_deg = np.rad2deg(
             [self.robot.get_joint(name) for name in self.joint_names]

@@ -336,8 +336,10 @@ class SimpleLeKiwiQuestIK:
                 btns = quest_action.get("buttons", {})
                 pos = quest_action.get("position", {})
                 logger.info(
-                    "Quest state — A=%s trig=%s grip=%s | pos_mm=(%.1f, %.1f, %.1f)",
+                    "Quest state — A(primary)=%s secondary=%s trig=%s grip=%s "
+                    "| pos_mm=(%.1f, %.1f, %.1f) — press A or B to arm",
                     btns.get("a", "?"),
+                    quest_action.get("secondaryButton", "n/a"),
                     btns.get("trigger", "?"),
                     btns.get("grip", "?"),
                     float(pos.get("x", 0)),
@@ -361,21 +363,26 @@ class SimpleLeKiwiQuestIK:
         assert self._neutral_T is not None
         assert self._last_joints is not None
 
-        delta_quest = q_pos - self._quest_zero  # (3,) mm in Quest space
+        delta_quest = q_pos - self._quest_zero  # (3,) mm in Quest/Fanuc space
 
         # Deadzone: L-inf in Quest space
         if float(np.max(np.abs(delta_quest))) < self.deadzone_mm:
             return self._hold_last(current_joints)
 
-        # Remap Quest axes → robot base frame, scale mm → m
-        delta_base = self._remap @ delta_quest * (self.position_scale * 1e-3)
+        # Remap Quest axes → local delta, scale mm → m
+        delta_local = self._remap @ delta_quest * (self.position_scale * 1e-3)
+
+        # Express delta in robot base frame using neutral EE orientation.
+        # This makes controller motion relative to the flange frame at arm time,
+        # so "push forward" always means "push the EE in the direction it was facing".
+        R_neutral = self._neutral_T[:3, :3]
+        delta_base = R_neutral @ delta_local
 
         # Clamp displacement magnitude
         norm = float(np.linalg.norm(delta_base))
         if norm > self.max_delta_m:
             delta_base *= self.max_delta_m / norm
 
-        # Target EE pose: neutral orientation, new base-frame position
         target_T = self._neutral_T.copy()
         target_T[:3, 3] = self._neutral_T[:3, 3] + delta_base
 
@@ -390,6 +397,14 @@ class SimpleLeKiwiQuestIK:
         except Exception as exc:
             logger.warning("IK failed (%s) — holding joints.", exc)
             return self._hold_last(current_joints)
+
+        logger.debug(
+            "IK: delta_quest=(%.1f,%.1f,%.1f)mm → delta_base=(%.3f,%.3f,%.3f)m | "
+            "joint_delta=%s deg",
+            *delta_quest,
+            *delta_base,
+            np.round(raw - self._last_joints, 1).tolist(),
+        )
 
         # Per-joint step limit
         raw = self._clamp_step(raw)
