@@ -369,14 +369,10 @@ class SimpleLeKiwiQuestIK:
         if float(np.max(np.abs(delta_quest))) < self.deadzone_mm:
             return self._hold_last(current_joints)
 
-        # Remap Quest axes → local delta, scale mm → m
-        delta_local = self._remap @ delta_quest * (self.position_scale * 1e-3)
-
-        # Express delta in robot base frame using neutral EE orientation.
-        # This makes controller motion relative to the flange frame at arm time,
-        # so "push forward" always means "push the EE in the direction it was facing".
-        R_neutral = self._neutral_T[:3, :3]
-        delta_base = R_neutral @ delta_local
+        # Remap Quest/Fanuc axes → robot base frame, scale mm → m.
+        # Applied directly in the robot base frame so each Quest axis maps
+        # consistently to a robot base axis regardless of EE orientation.
+        delta_base = self._remap @ delta_quest * (self.position_scale * 1e-3)
 
         # Clamp displacement magnitude
         norm = float(np.linalg.norm(delta_base))
@@ -398,13 +394,17 @@ class SimpleLeKiwiQuestIK:
             logger.warning("IK failed (%s) — holding joints.", exc)
             return self._hold_last(current_joints)
 
-        logger.debug(
-            "IK: delta_quest=(%.1f,%.1f,%.1f)mm → delta_base=(%.3f,%.3f,%.3f)m | "
-            "joint_delta=%s deg",
-            *delta_quest,
-            *delta_base,
-            np.round(raw - self._last_joints, 1).tolist(),
-        )
+        if not hasattr(self, "_ik_log_cnt"):
+            self._ik_log_cnt = 0
+        self._ik_log_cnt += 1
+        if self._ik_log_cnt % 20 == 1:
+            logger.info(
+                "IK: quest_delta=(%.0f,%.0f,%.0f)mm → base=(%.3f,%.3f,%.3f)m "
+                "| Δjoints=%s°",
+                *delta_quest,
+                *delta_base,
+                [round(float(v), 1) for v in (raw - self._last_joints)],
+            )
 
         # Per-joint step limit
         raw = self._clamp_step(raw)
