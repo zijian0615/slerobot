@@ -10,7 +10,7 @@ from matplotlib.animation import FuncAnimation
 import paho.mqtt.client as mqtt
 
 # ───────────────── MQTT 配置 ─────────────────
-MQTT_BROKER = "10.22.9.10"
+MQTT_BROKER = "10.22.55.72"   # Mac 本机 IP
 MQTT_PORT = 1883
 MQTT_TOPIC = "quest/data"
 

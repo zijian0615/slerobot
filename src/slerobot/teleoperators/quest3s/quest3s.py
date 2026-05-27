@@ -39,7 +39,7 @@ class Quest3sController(Teleoperator):
             "buttons": {"trigger": 0, "grip": 0, "a": 0},
         }
 
-    def connect(self):
+    def connect(self, connect_timeout: float = 10.0):
         try:
             logger.info(
                 "[Quest3s] Connecting to %s:%s topic %s",
@@ -51,14 +51,25 @@ class Quest3sController(Teleoperator):
             self.client.on_connect = self._on_connect
             self.client.on_message = self._on_message
             self.client.on_disconnect = self._on_disconnect
+            self.client._connect_timeout = connect_timeout
             self.client.connect(self.mqtt_broker, self.mqtt_port, 60)
             self.listener_thread = threading.Thread(target=self._mqtt_loop, daemon=True)
             self.listener_thread.start()
             self.is_connected = True
             logger.info("[Quest3s] Connected and listening.")
         except Exception as e:
-            logger.error("[Quest3s] Connection failed: %s", e)
-            raise
+            logger.error(
+                "[Quest3s] Connection failed: %s\n"
+                "  请检查：\n"
+                "  1. Quest3s MQTT 服务是否已启动\n"
+                "  2. Broker 地址和端口是否正确（当前：%s:%s）\n"
+                "  3. 网络是否可达（ping %s）",
+                e, self.mqtt_broker, self.mqtt_port, self.mqtt_broker,
+            )
+            raise ConnectionError(
+                f"Quest3s MQTT broker '{self.mqtt_broker}:{self.mqtt_port}' 无法连接：{e}\n"
+                f"如果不需要遥操作，请去掉 --teleop 相关参数。"
+            ) from e
 
     def disconnect(self):
         try:
@@ -69,10 +80,10 @@ class Quest3sController(Teleoperator):
         except Exception as e:
             logger.error("[Quest3s] Disconnection failed: %s", e)
 
-    def get_action(self) -> dict:
-        """Latest MQTT frame, or neutral pose if none received yet."""
+    def get_action(self) -> dict | None:
+        """最新 MQTT 帧。若尚未收到任何数据返回 None（调用方应跳过本帧）。"""
         with self._lock:
-            return self._latest_action if self._latest_action is not None else self._neutral_action()
+            return self._latest_action
 
     def _on_connect(self, client, userdata, flags, rc):
         logger.info("[Quest3s] MQTT connected rc=%s", rc)

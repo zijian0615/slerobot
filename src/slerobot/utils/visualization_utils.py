@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 from typing import Any
 
@@ -20,14 +21,55 @@ import rerun as rr
 
 from slerobot.policies.act.modeling_act import ACTEigenCAMHelper
 
+logger = logging.getLogger(__name__)
 
-def _init_rerun(session_name: str = "lerobot_control_loop") -> None:
-    """Initializes the Rerun SDK for visualizing the control loop."""
-    batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "8000")
-    os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
-    rr.init(session_name)
+
+def _set_rerun_control_step(step: int) -> None:
+    """Set timeline step (compatible with rerun-sdk 0.32+ and older APIs)."""
+    if hasattr(rr, "set_time"):
+        rr.set_time("control_step", sequence=int(step))
+    elif hasattr(rr, "set_time_sequence"):
+        rr.set_time_sequence("control_step", int(step))
+
+
+def _init_rerun(
+    session_name: str = "lerobot_control_loop",
+    connect_ip: str | None = None,
+    connect_port: int | None = None,
+) -> None:
+    """Initialize Rerun and open (or connect to) the viewer for live streaming."""
+    os.environ["RERUN_FLUSH_NUM_BYTES"] = os.getenv("RERUN_FLUSH_NUM_BYTES", "8000")
     memory_limit = os.getenv("LEROBOT_RERUN_MEMORY_LIMIT", "10%")
-    rr.spawn(memory_limit=memory_limit)
+    try:
+        if connect_ip:
+            rr.init(session_name)
+            port = connect_port if connect_port is not None else 9876
+            rr.connect(f"rerun+http://{connect_ip}:{port}/proxy")
+            logger.info(
+                "Rerun SDK connected to gRPC proxy at %s:%d (use web UI at http://127.0.0.1:9090)",
+                connect_ip,
+                port,
+            )
+        else:
+            try:
+                rr.init(session_name, spawn=True, memory_limit=memory_limit)
+            except TypeError:
+                rr.init(session_name)
+                rr.spawn(memory_limit=memory_limit)
+            logger.info(
+                "Rerun native viewer spawned (gRPC :9876). For browser UI run: "
+                "rerun --serve-web --web-viewer --web-viewer-port 9090"
+            )
+    except Exception as exc:
+        logger.warning("Failed to start Rerun: %s", exc)
+        raise
+
+
+def shutdown_rerun() -> None:
+    try:
+        rr.disconnect()
+    except Exception:
+        pass
 
 
 def _to_uint8_image(image: np.ndarray) -> np.ndarray:
@@ -52,7 +94,11 @@ def log_rerun_data(
     grad_cam_edge_margin_px: int | None = None,
     grad_cam_edge_roi_mode: str = "mitigation",
     attention_overlay_helper: type = ACTEigenCAMHelper,
+    control_step: int | None = None,
 ):
+    if control_step is not None:
+        _set_rerun_control_step(control_step)
+
     for obs, val in observation.items():
         if isinstance(val, float):
             rr.log(f"observation.{obs}", rr.Scalars(val))
@@ -61,7 +107,7 @@ def log_rerun_data(
                 for i, v in enumerate(val):
                     rr.log(f"observation.{obs}_{i}", rr.Scalars(float(v)))
             else:
-                rr.log(f"observation.{obs}", rr.Image(_to_uint8_image(val)), static=True)
+                rr.log(f"observation.{obs}", rr.Image(_to_uint8_image(val)))
                 if attention_maps and obs in attention_maps:
                     edge_warning = bool(grad_cam_edge_warnings.get(obs, False)) if grad_cam_edge_warnings else False
                     edge_mean = grad_cam_edge_stats.get(obs) if grad_cam_edge_stats else None
@@ -76,7 +122,7 @@ def log_rerun_data(
                         edge_warning_threshold=grad_cam_edge_threshold,
                         edge_warning_roi_mode=grad_cam_edge_roi_mode,
                     )
-                    rr.log(f"observation.{obs}_attention", rr.Image(attn_overlay), static=True)
+                    rr.log(f"observation.{obs}_attention", rr.Image(attn_overlay))
 
     for act, val in action.items():
         if isinstance(val, float):
