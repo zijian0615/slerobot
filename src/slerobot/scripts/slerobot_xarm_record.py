@@ -18,15 +18,14 @@ xArm 数据采集脚本
     xArm qy = +qx_u   (X→-Y, 两次取反相消)
     xArm qz = -qy_u   (Y→Z, LH→RH反向)
 
-用法示例（笛卡尔模式 + Quest3s 遥操作 + OpenCV 相机）：
-    python -m slerobot.scripts.slerobot_xarm_record \
+用法示例（笛卡尔模式 + Quest3s 遥操作）：
+    python slerobot_xarm_record.py \
         --dataset.repo_id=zijian2022/xarm_demo \
         --dataset.single_task="pick and place" \
         --robot.robot_ip=192.168.1.204 \
         --robot.robot_dof=6 \
         --robot.robot_mode=7 \
         --robot.gripper_type=1 \
-        --robot.cameras='{"front": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 20}}' \
         --teleop.mqtt_broker=10.22.9.10
 
 用法示例（回放策略）：
@@ -53,7 +52,6 @@ from slerobot.configs.policies import PreTrainedConfig
 from slerobot.teleoperators import Teleoperator
 from slerobot.teleoperators.quest3s import Quest3sController
 from slerobot.robots import Robot
-from slerobot.cameras.utils import make_cameras_from_configs
 from slerobot.robots.xarm import XArmConfig, XArmRobot
 
 from slerobot.utils.constants import ACTION, OBS_STR
@@ -237,23 +235,103 @@ def _qnorm(q: np.ndarray) -> np.ndarray:
     return q / n if n > 1e-9 else np.array([0., 0., 0., 1.])
 
 
-def _unity_to_xarm_quat(qx_u: float, qy_u: float, qz_u: float, qw_u: float) -> np.ndarray:
+# Unity LH (X=right, Y=up, Z=forward) → xArm RH (X=forward, Y=left, Z=up)
+# 与 lekiwi quest_axis_remap="z,-x,y" 一致，用于旋转矩阵相似变换。
+_QUEST_TO_XARM = np.array([
+    [0.0, 0.0, 1.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+], dtype=float)
+
+
+def _unity_quat(qx_u: float, qy_u: float, qz_u: float, qw_u: float) -> np.ndarray:
+    """归一化 Unity 原始四元数 [qx, qy, qz, qw]。"""
+    return _qnorm(np.array([qx_u, qy_u, qz_u, qw_u], dtype=float))
+
+
+def _q_to_mat3(q: np.ndarray) -> np.ndarray:
+    """单位四元数 [qx, qy, qz, qw] → 3×3 旋转矩阵。"""
+    q = _qnorm(q)
+    x, y, z, w = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ], dtype=float)
+
+
+def _mat3_to_quat(R: np.ndarray) -> np.ndarray:
+    """3×3 旋转矩阵 → 单位四元数 [qx, qy, qz, qw]。"""
+    m00, m01, m02 = R[0]
+    m10, m11, m12 = R[1]
+    m20, m21, m22 = R[2]
+    trace = m00 + m11 + m22
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        return _qnorm(np.array([
+            (m21 - m12) / s,
+            (m02 - m20) / s,
+            (m10 - m01) / s,
+            0.25 * s,
+        ]))
+    if m00 > m11 and m00 > m22:
+        s = math.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        return _qnorm(np.array([
+            0.25 * s,
+            (m01 + m10) / s,
+            (m02 + m20) / s,
+            (m21 - m12) / s,
+        ]))
+    if m11 > m22:
+        s = math.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        return _qnorm(np.array([
+            (m01 + m10) / s,
+            0.25 * s,
+            (m12 + m21) / s,
+            (m02 - m20) / s,
+        ]))
+    s = math.sqrt(1.0 + m22 - m00 - m11) * 2.0
+    return _qnorm(np.array([
+        (m02 + m20) / s,
+        (m12 + m21) / s,
+        0.25 * s,
+        (m10 - m01) / s,
+    ]))
+
+
+def _mat3_to_aa(R: np.ndarray) -> tuple[float, float, float]:
+    """3×3 旋转矩阵 → xArm 轴角向量 [rx, ry, rz]（弧度）。"""
+    return _quat_to_aa(_mat3_to_quat(R))
+
+
+def _aa_to_mat3(rx: float, ry: float, rz: float) -> np.ndarray:
+    """xArm 轴角向量 [rx, ry, rz]（弧度）→ 3×3 旋转矩阵。"""
+    return _q_to_mat3(_aa_to_quat(rx, ry, rz))
+
+
+def _unity_delta_quat_to_xarm(q_delta_u: np.ndarray) -> np.ndarray:
     """
-    将 Unity 左手系四元数转换为 xArm 右手系四元数。
-
-    坐标系对应关系：
-        Unity LH: X=right,  Y=up,   Z=forward
-        xArm  RH: X=forward, Y=left, Z=up
-
-    轴映射（含 LH→RH 旋转方向取反）：
-        xArm qx = -qz_u   (Unity Z→xArm X, LH→RH方向取反)
-        xArm qy = +qx_u   (Unity X→xArm Y)
-        xArm qz = -qy_u   (Unity Y→xArm Z, LH→RH方向取反)
-        xArm qw =  qw_u   (标量不变)
-
-    经实测校正：xArm X 正确；原 Y/Z 效果互换，对调后修正。
+    Unity 左手系增量四元数 → xArm 右手系增量四元数。
+    Step1: LH→RH，翻转 qx、qz
+    Step2: 轴重映射 Unity(X=right,Y=up,Z=fwd) → xArm(X=fwd,Y=left,Z=up)
     """
-    return _qnorm(np.array([-qz_u, qx_u, -qy_u, qw_u]))
+    qx, qy, qz, qw = q_delta_u
+    # LH→RH: 翻转所有虚部分量（det=-1 变换，确保 Unity Y → xArm Z 正确取反）
+    qx_rh, qy_rh, qz_rh = -qx, -qy, -qz
+    # 轴重映射
+    return _qnorm(np.array([
+         qz_rh,   # xArm X ← Unity Z
+        -qx_rh,   # xArm Y ← -Unity X
+         qy_rh,   # xArm Z ← Unity Y
+         qw,
+    ]))
+
+
+def _quest_local_rot_delta_to_xarm(q_cur_u: np.ndarray, q_home_u: np.ndarray) -> np.ndarray:
+    q_delta_u = _qnorm(_qmul(_qconj(q_home_u), q_cur_u))
+    q_delta_xarm = _unity_delta_quat_to_xarm(q_delta_u)
+
+    return _q_to_mat3(q_delta_xarm)
 
 
 
@@ -349,42 +427,46 @@ def _teleop_to_xarm_action(
             xarm_act["j1"] = raw_y
             xarm_act["j2"] = raw_z
 
-        # ── 旋转：Unity LH 四元数 → xArm RH 四元数 → delta → 目标欧拉角 ──
+        # ── 旋转：Unity 原始四元数 → 本地 delta → P 轴映射 → xArm 轴角 ──
         #
-        # MQTT 中的 qx/qy/qz/qw 是 Quest 手柄的原始 Unity 左手系四元数。
-        # 使用 _unity_to_xarm_quat() 统一转换，与 teleop_home_quat 的转换方式保持一致，
-        # 确保 delta 计算在同一坐标系下进行。
+        # MQTT 中的 qx/qy/qz/qw 是 Quest 手柄原始 Unity 四元数（左手系）。
+        # 不能用分量重排 (-qz, qx, -qy, qw) 代替坐标系变换：手柄 home 有倾角时
+        # 会把绕前后/左右轴的旋转耦合成 rx/ry/rz 混合（表现为轴串扰）。
         qx_u = float(act.get("qx", 0.0))
         qy_u = float(act.get("qy", 0.0))
         qz_u = float(act.get("qz", 0.0))
         qw_u = float(act.get("qw", 1.0))
         has_valid_quat = (abs(qx_u) + abs(qy_u) + abs(qz_u) + abs(qw_u)) > 0.5
+        q_cur_u = _unity_quat(qx_u, qy_u, qz_u, qw_u)
 
-        # ★ 核心修正：Unity LH → xArm RH
-        #   xArm qx = -qz_u,  xArm qy = +qx_u,  xArm qz = -qy_u
-        q_cur = _unity_to_xarm_quat(qx_u, qy_u, qz_u, qw_u)
-
+        print(f"[DBG] robot_home_rot_deg={robot_home_rot_deg}")
+        # if has_valid_quat and teleop_home_quat is not None and robot_home_rot_deg is not None:
+        #     rrx, rry, rrz = (math.radians(d) for d in robot_home_rot_deg)
+        #     q_delta_u = _qnorm(_qmul(_qconj(teleop_home_quat), q_cur_u))
+        #     q_delta_xarm = _unity_delta_quat_to_xarm(q_delta_u)   # ← 新函数
+        #     R_delta_x = _q_to_mat3(q_delta_xarm)
+        #     R_robot_home = _aa_to_mat3(rrx, rry, rrz)
+        #     R_tgt = R_robot_home @ R_delta_x
+        #     j3, j4, j5 = _mat3_to_aa(R_tgt)
         if has_valid_quat and teleop_home_quat is not None and robot_home_rot_deg is not None:
-            # delta = q_current * conj(q_home)  → 相对于 home 的旋转增量（xArm 坐标系）
-            q_delta = _qnorm(_qmul(q_cur, _qconj(teleop_home_quat)))
-            # 机器人 home 四元数（由 get_position_aa 读取的轴角向量转换，单位 rad）
             rrx, rry, rrz = (math.radians(d) for d in robot_home_rot_deg)
-            q_robot_home = _aa_to_quat(rrx, rry, rrz)  # axis-angle → quat
-            # 目标旋转 = delta 叠加到机器人 home 上
-            q_tgt = _qnorm(_qmul(q_delta, q_robot_home))
-            # 转回轴角向量发给 set_servo_cartesian_aa（_aa 格式）
-            j3, j4, j5 = _quat_to_aa(q_tgt)
+            q_delta_u = _qnorm(_qmul(_qconj(teleop_home_quat), q_cur_u))
+            q_delta_xarm = _unity_delta_quat_to_xarm(q_delta_u)
+            R_delta_x = _q_to_mat3(q_delta_xarm)
+            R_robot_home = _aa_to_mat3(rrx, rry, rrz)
+            R_tgt = R_delta_x @ R_robot_home   # ← 改这里，顺序对调
+            j3, j4, j5 = _mat3_to_aa(R_tgt)
         elif robot_home_rot_deg is not None:
-            # home 四元数未初始化时：固定在 robot_home 姿态，等待手势稳定
             rrx, rry, rrz = robot_home_rot_deg
             j3, j4, j5 = math.radians(rrx), math.radians(rry), math.radians(rrz)
         else:
             j3, j4, j5 = 0.0, 0.0, 0.0
 
-        # axis-angle 模长 ∈ [0, π]，钳位到 ±π 保护
-        xarm_act["j3"] = max(-math.pi, min(math.pi, j3))
-        xarm_act["j4"] = max(-math.pi, min(math.pi, j4))
-        xarm_act["j5"] = max(-math.pi, min(math.pi, j5))
+        # 轴角 → 6D 旋转（连续无跳变），供 send_action 和数据集使用
+        from slerobot.robots.xarm.xarm import _aa_to_rot6d, _ROT6D_KEYS
+        rot6d = _aa_to_rot6d(j3, j4, j5)
+        for key, val in zip(_ROT6D_KEYS, rot6d):
+            xarm_act[key] = val
 
     else:
         # 关节模式（mode=6）：teleop 应直接提供关节角（如 GELLO）
@@ -487,8 +569,7 @@ def record_loop(
     _robot_home_rot_deg = robot_home_rot_deg
 
     # ── teleop_home_quat：首帧自动从 MQTT 读取，无需手动配置 ──
-    # 使用与 _teleop_to_xarm_action 完全相同的 _unity_to_xarm_quat() 转换，
-    # 确保 delta = q_cur * conj(q_home) 在同一坐标系下计算。
+    # 保存 Unity 原始四元数；旋转 delta 在 _quest_local_rot_delta_to_xarm() 中做轴映射。
     _teleop_home_quat: np.ndarray | None = None
 
     # home 捕获后跳过若干帧，等待手势稳定，避免首帧大幅跳变
@@ -601,18 +682,17 @@ def record_loop(
                 )
                 record_loop._mqtt_dbg_last = time.perf_counter()
 
-            # ── 首帧自动记录 teleop_home 四元数 ──
-            # ★ 使用与 _teleop_to_xarm_action 完全相同的转换函数 _unity_to_xarm_quat()
+            # ── 首帧自动记录 teleop_home 四元数（Unity 原始值）──
             if _teleop_home_quat is None:
                 qx_h = float(raw_act.get("qx", 0.0))
                 qy_h = float(raw_act.get("qy", 0.0))
                 qz_h = float(raw_act.get("qz", 0.0))
                 qw_h = float(raw_act.get("qw", 1.0))
                 if abs(qx_h) + abs(qy_h) + abs(qz_h) + abs(qw_h) > 0.5:
-                    _teleop_home_quat = _unity_to_xarm_quat(qx_h, qy_h, qz_h, qw_h)
+                    _teleop_home_quat = _unity_quat(qx_h, qy_h, qz_h, qw_h)
                     _home_capture_skip = _HOME_SKIP_FRAMES
                     logging.info(
-                        "[xArm Record] teleop_home_quat(xArm frame) 已从首帧读取："
+                        "[xArm Record] teleop_home_quat(Unity) 已从首帧读取："
                         "[%.4f, %.4f, %.4f, %.4f]，跳过前 %d 帧等待手势稳定",
                         *_teleop_home_quat, _HOME_SKIP_FRAMES,
                     )
@@ -758,9 +838,6 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
         cameras=cfg.robot.cameras or {},
     )
     robot = XArmRobot(xarm_cfg)
-    if cfg.robot.cameras:
-        robot.cameras = make_cameras_from_configs(cfg.robot.cameras)
-        logging.info("Configured %d camera(s): %s", len(robot.cameras), list(robot.cameras.keys()))
 
     # ── 构建 Teleop ──
     teleop: Teleoperator | None = None
@@ -805,16 +882,6 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
         except Exception as exc:
             raise ValueError(f"Unsupported policy type: {cfg.policy.type}") from exc
 
-    # ── 数据集特征（须在相机初始化之后，否则 observation.images.* 不会写入 schema）──
-    dataset_features = combine_feature_dicts(robot.observation_features, robot.action_features)
-    video_feature_keys = [k for k, v in dataset_features.items() if v.get("dtype") == "video"]
-    if cfg.robot.cameras and not video_feature_keys:
-        logging.warning(
-            "Cameras are configured but dataset has no video features; "
-            "frames will not be saved as video."
-        )
-    elif video_feature_keys:
-        logging.info("Dataset will record video features: %s", video_feature_keys)
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
 
     dataset  = None
@@ -822,7 +889,12 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
     events   = None
 
     try:
-        num_cameras = len(robot.cameras) if robot.cameras else 0
+        # ── 先连接机器人，相机初始化后才能获取正确的特征（含相机列）──
+        robot.connect()
+
+        # ── 数据集特征（connect 后读取，包含相机）──
+        dataset_features = combine_feature_dicts(robot.observation_features, robot.action_features)
+        num_cameras = len(robot.cameras) if robot.cameras else 1
 
         if cfg.resume:
             dataset = sLerobotDataset(
@@ -856,9 +928,6 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                 encoder_threads=cfg.dataset.encoder_threads,
             )
 
-        # ── 连接机器人 ──
-        robot.connect()
-
         # robot_home：连接后立即读取（此时机器人在 start_joints 位置）
         resolved_robot_home_pos     = cfg.robot.robot_home_pos
         resolved_robot_home_rot_deg = cfg.robot.robot_home_rot_deg
@@ -875,10 +944,19 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                 float(init_obs.get("j2", 0)),
             )
             import math as _math
+            from slerobot.robots.xarm.xarm import _rot6d_to_aa, _ROT6D_KEYS
+            if all(k in init_obs for k in _ROT6D_KEYS):
+                # get_observation 返回 6D 旋转，转回轴角再转度数
+                _rx, _ry, _rz = _rot6d_to_aa(
+                    float(init_obs["r0"]), float(init_obs["r1"]), float(init_obs["r2"]),
+                    float(init_obs["r3"]), float(init_obs["r4"]), float(init_obs["r5"]),
+                )
+            else:
+                _rx = float(init_obs.get("j3", 0))
+                _ry = float(init_obs.get("j4", 0))
+                _rz = float(init_obs.get("j5", 0))
             resolved_robot_home_rot_deg = (
-                _math.degrees(float(init_obs.get("j3", 0))),
-                _math.degrees(float(init_obs.get("j4", 0))),
-                _math.degrees(float(init_obs.get("j5", 0))),
+                _math.degrees(_rx), _math.degrees(_ry), _math.degrees(_rz),
             )
             logging.info(
                 "[xArm Record] robot_home_pos=%s  robot_home_rot_deg=%s",

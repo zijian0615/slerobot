@@ -51,7 +51,7 @@ from .pipeline import (
     #DoneProcessorStep,
     IdentityProcessorStep,
     #InfoProcessorStep,
-    ObservationProcessorStep,
+    #ObservationProcessorStep,
     PolicyActionProcessorStep,
     PolicyProcessorPipeline,
     #ProcessorKwargs,

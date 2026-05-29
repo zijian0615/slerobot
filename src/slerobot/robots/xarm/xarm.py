@@ -1,11 +1,93 @@
 import logging
 import math
 import struct
+import threading
 import time
 from enum import IntEnum
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
+
+
+# ── 6D 旋转表示工具 ─────────────────────────────────────────────────────── #
+# 使用旋转矩阵前两列（6个标量），完全连续无奇异，适合模仿学习。
+# 键名 r0..r2 = 第一列，r3..r5 = 第二列。
+# 参考：Zhou et al., "On the Continuity of Rotation Representations in
+#       Neural Networks", CVPR 2019.
+
+_ROT6D_KEYS = ("r0", "r1", "r2", "r3", "r4", "r5")
+
+
+def _aa_to_rot6d(rx: float, ry: float, rz: float) -> Tuple[float, ...]:
+    """轴角向量 [rx,ry,rz]（弧度）→ 6D 旋转（旋转矩阵前两列，列优先）。"""
+    angle = math.sqrt(rx * rx + ry * ry + rz * rz)
+    if angle < 1e-9:
+        # 单位矩阵前两列
+        return (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+    c, s = math.cos(angle), math.sin(angle)
+    t = 1.0 - c
+    ax, ay, az = rx / angle, ry / angle, rz / angle
+    # Rodrigues 公式 → 旋转矩阵
+    R = [
+        [t*ax*ax + c,     t*ax*ay - s*az, t*ax*az + s*ay],
+        [t*ax*ay + s*az,  t*ay*ay + c,    t*ay*az - s*ax],
+        [t*ax*az - s*ay,  t*ay*az + s*ax, t*az*az + c   ],
+    ]
+    # 前两列（列优先存储）
+    return (R[0][0], R[1][0], R[2][0], R[0][1], R[1][1], R[2][1])
+
+
+def _rot6d_to_aa(r0: float, r1: float, r2: float,
+                 r3: float, r4: float, r5: float) -> Tuple[float, float, float]:
+    """6D 旋转 → 轴角向量 [rx,ry,rz]（弧度）。用 Gram-Schmidt 重建旋转矩阵。"""
+    # 第一列：直接归一化
+    c0 = np.array([r0, r1, r2], dtype=float)
+    n0 = np.linalg.norm(c0)
+    c0 = c0 / n0 if n0 > 1e-9 else np.array([1.0, 0.0, 0.0])
+    # 第二列：减去投影后归一化
+    c1 = np.array([r3, r4, r5], dtype=float)
+    c1 = c1 - np.dot(c1, c0) * c0
+    n1 = np.linalg.norm(c1)
+    c1 = c1 / n1 if n1 > 1e-9 else np.array([0.0, 1.0, 0.0])
+    # 第三列：叉积
+    c2 = np.cross(c0, c1)
+    # 旋转矩阵
+    R = np.column_stack([c0, c1, c2])
+    # 矩阵 → 四元数 → 轴角
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (R[2, 1] - R[1, 2]) / s
+        qy = (R[0, 2] - R[2, 0]) / s
+        qz = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        qw = (R[2, 1] - R[1, 2]) / s
+        qx = 0.25 * s
+        qy = (R[0, 1] + R[1, 0]) / s
+        qz = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        qw = (R[0, 2] - R[2, 0]) / s
+        qx = (R[0, 1] + R[1, 0]) / s
+        qy = 0.25 * s
+        qz = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        qw = (R[1, 0] - R[0, 1]) / s
+        qx = (R[0, 2] + R[2, 0]) / s
+        qy = (R[1, 2] + R[2, 1]) / s
+        qz = 0.25 * s
+    if qw < 0:
+        qx, qy, qz, qw = -qx, -qy, -qz, -qw
+    qw = max(-1.0, min(1.0, qw))
+    angle = 2.0 * math.acos(qw)
+    sin_half = math.sqrt(max(0.0, 1.0 - qw * qw))
+    if sin_half < 1e-9:
+        return 0.0, 0.0, 0.0
+    f = angle / sin_half
+    return float(qx * f), float(qy * f), float(qz * f)
 
 from slerobot.cameras.utils import make_cameras_from_configs
 
@@ -62,6 +144,12 @@ class XArmRobot(Robot):
         self._latest_pose: Optional[np.ndarray] = None  # [x,y,z,rx,ry,rz] in radians
         self._latest_t: Optional[float] = None
         self._latest_gripper_norm: float = 0.0
+
+        # 相机异步缓存：后台线程持续采集，主循环只读最新帧
+        self._cam_frames: dict = {}        # cam_name -> latest np.ndarray
+        self._cam_lock = threading.Lock()
+        self._cam_threads: list = []
+        self._cam_stop = threading.Event()
 
     # ------------------------------------------------------------------ #
     #  夹爪参数构建                                                          #
@@ -199,14 +287,34 @@ class XArmRobot(Robot):
 
         self._connected = True
 
-        # 初始化相机（若 record 脚本已提前 make_cameras_from_configs，则只 connect）
+        # 初始化相机并启动异步采集线程
         if self.config.cameras:
-            if not self.cameras:
-                self.cameras = make_cameras_from_configs(self.config.cameras)
-            for cam in self.cameras.values():
+            self.cameras = make_cameras_from_configs(self.config.cameras)
+            self._cam_stop.clear()
+            for cam_name, cam in self.cameras.items():
                 cam.connect()
+                t = threading.Thread(
+                    target=self._cam_capture_loop,
+                    args=(cam_name, cam),
+                    daemon=True,
+                    name=f"cam-{cam_name}",
+                )
+                t.start()
+                self._cam_threads.append(t)
+                logger.info("XArmRobot: camera '%s' async thread started.", cam_name)
 
         logger.info("XArmRobot: connected (DOF=%d, mode=%d).", self._dof, self._mode)
+
+    def _cam_capture_loop(self, cam_name: str, cam) -> None:
+        """后台线程：持续读取相机帧并写入缓存，主循环零等待取最新帧。"""
+        while not self._cam_stop.is_set():
+            try:
+                frame = cam.read()
+                if frame is not None:
+                    with self._cam_lock:
+                        self._cam_frames[cam_name] = frame
+            except Exception as exc:
+                logger.debug("Camera '%s' read error: %s", cam_name, exc)
 
     def _clear_and_enable(self) -> None:
         """清除控制器错误并使能机械臂，切换到 mode=0 就绪状态。"""
@@ -221,6 +329,12 @@ class XArmRobot(Robot):
         if not self._connected:
             return
 
+        # 停止相机后台线程
+        self._cam_stop.set()
+        for t in self._cam_threads:
+            t.join(timeout=1.0)
+        self._cam_threads.clear()
+
         try:
             if self.real_arm is not None:
                 self.real_arm.disconnect()
@@ -234,6 +348,7 @@ class XArmRobot(Robot):
                 logger.warning("Error disconnecting camera: %s", exc)
 
         self.cameras = {}
+        self._cam_frames = {}
         self._connected = False
         logger.info("XArmRobot: disconnected.")
 
@@ -327,6 +442,27 @@ class XArmRobot(Robot):
     #  核心接口：send_action / get_observation                              #
     # ------------------------------------------------------------------ #
 
+    def _action_to_pose(self, action: Dict) -> list:
+        """action 字典 → xArm pose [x, y, z, rx, ry, rz]（mm + 弧度）。
+
+        支持两种旋转格式：
+          - 6D 旋转（r0..r5）：旋转矩阵前两列，连续无奇异（推荐，模仿学习友好）
+          - 轴角（j3..j5）：向后兼容
+        """
+        x = float(action.get("j0", 0.0))
+        y = float(action.get("j1", 0.0))
+        z = float(action.get("j2", 0.0))
+        if all(k in action for k in _ROT6D_KEYS):
+            rx, ry, rz = _rot6d_to_aa(
+                float(action["r0"]), float(action["r1"]), float(action["r2"]),
+                float(action["r3"]), float(action["r4"]), float(action["r5"]),
+            )
+        else:
+            rx = float(action.get("j3", 0.0))
+            ry = float(action.get("j4", 0.0))
+            rz = float(action.get("j5", 0.0))
+        return [x, y, z, rx, ry, rz]
+
     def send_action(self, action: Dict) -> Dict:
         """
         发送控制指令。
@@ -398,7 +534,7 @@ class XArmRobot(Robot):
                 )
 
         elif self._mode == 7:
-            pose = [float(action[f"j{i}"]) for i in range(6)]
+            pose = self._action_to_pose(action)
             # 命令队列满时跳过本帧，避免积压导致 FPS 下降和跟手延迟
             cmd_num = getattr(self.real_arm, "cmd_num", 0)
             if cmd_num > 3:
@@ -413,7 +549,7 @@ class XArmRobot(Robot):
                 )
         else:
             # mode=1: Cartesian servo（笛卡尔伺服，每帧直接覆盖目标位置，无轨迹队列）
-            pose = [float(action[f"j{i}"]) for i in range(6)]
+            pose = self._action_to_pose(action)
 
             if self.real_arm.mode != 1:
                 # 切换到 Cartesian servo 模式
@@ -516,18 +652,22 @@ class XArmRobot(Robot):
             if code != 0 or pose is None:
                 logger.warning("get_position_aa returned code=%d", code)
                 pose = [0.0] * 6
-            for i, v in enumerate(pose[:6]):
-                obs[f"j{i}"] = float(v)
+            # 位置：j0, j1, j2（mm）
+            for i in range(3):
+                obs[f"j{i}"] = float(pose[i])
+            # 姿态：6D 旋转表示（r0..r5），替代轴角 j3..j5 避免跳变
+            rot6d = _aa_to_rot6d(float(pose[3]), float(pose[4]), float(pose[5]))
+            for key, val in zip(_ROT6D_KEYS, rot6d):
+                obs[key] = val
 
-        # 夹爪状态
+        # 夹爪状态：二值化（与 Quest grip 按钮保持一致）
         gripper_norm = self._read_gripper_norm()
-        obs["j7"] = gripper_norm
+        obs["j7"] = 1.0 if gripper_norm >= 0.5 else 0.0
         obs["timestamp"] = time.perf_counter()
 
-        # 相机
-        for cam_name, camera in self.cameras.items():
-            frame = camera.read()
-            if frame is not None:
+        # 相机：从后台线程缓存取最新帧，不阻塞控制循环
+        with self._cam_lock:
+            for cam_name, frame in self._cam_frames.items():
                 obs[cam_name] = frame
 
         return obs
@@ -575,24 +715,16 @@ class XArmRobot(Robot):
         if self._mode == 6:
             feats = {f"j{i}": float for i in range(self._dof)}
         else:
-            feats = {f"j{i}": float for i in range(6)}
+            # 笛卡尔模式：位置 j0..j2 + 6D 旋转 r0..r5（无跳变）
+            feats = {f"j{i}": float for i in range(3)}
+            feats.update({k: float for k in _ROT6D_KEYS})
 
         feats["j7"] = float  # gripper norm
 
-        if self.cameras:
-            for cam_name, camera in self.cameras.items():
-                h = camera.height if hasattr(camera, "height") and camera.height else 480
-                w = camera.width if hasattr(camera, "width") and camera.width else 640
-                feats[cam_name] = (h, w, 3)
-        elif self.config.cameras:
-            for cam_name, cam_cfg in self.config.cameras.items():
-                if isinstance(cam_cfg, dict):
-                    h = cam_cfg.get("height") or 480
-                    w = cam_cfg.get("width") or 640
-                else:
-                    h = cam_cfg.height or 480
-                    w = cam_cfg.width or 640
-                feats[cam_name] = (h, w, 3)
+        for cam_name, camera in self.cameras.items():
+            h = camera.height if hasattr(camera, "height") else 480
+            w = camera.width if hasattr(camera, "width") else 640
+            feats[cam_name] = (h, w, 3)
 
         return feats
 
@@ -601,7 +733,9 @@ class XArmRobot(Robot):
         if self._mode == 6:
             feats = {f"j{i}": float for i in range(self._dof)}
         else:
-            feats = {f"j{i}": float for i in range(6)}
+            # 笛卡尔模式：位置 j0..j2 + 6D 旋转 r0..r5（无跳变）
+            feats = {f"j{i}": float for i in range(3)}
+            feats.update({k: float for k in _ROT6D_KEYS})
 
         feats["j7"] = float  # gripper norm
 

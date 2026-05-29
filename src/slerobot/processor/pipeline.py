@@ -1444,36 +1444,6 @@ class ActionProcessorStep(PolicyActionProcessorStep, ABC):
 
     pass
 
-
-class ObservationProcessorStep(ProcessorStep, ABC):
-    """An abstract `ProcessorStep` for processing a `RobotObservation` (a dictionary)."""
-
-    @abstractmethod
-    def observation(self, observation: RobotObservation) -> RobotObservation:
-        """Processes a `RobotObservation`. Subclasses must implement this method.
-
-        Args:
-            observation: The input `RobotObservation` dictionary.
-
-        Returns:
-            The processed `RobotObservation`.
-        """
-        ...
-
-    def __call__(self, transition: EnvTransition) -> EnvTransition:
-        """Applies the `observation` method to the transition's observation."""
-        self._current_transition = transition.copy()
-        new_transition = self._current_transition
-
-        obs = new_transition.get(TransitionKey.OBSERVATION)
-        if obs is None or not isinstance(obs, dict):
-            raise ValueError(
-                f"Observation should be a RobotObservation type (dict), but got {type(obs)}"
-            )
-
-        new_transition[TransitionKey.OBSERVATION] = self.observation(obs.copy())
-        return new_transition
-
 class IdentityProcessorStep(ProcessorStep):
     """A no-op processor step that returns the input transition and features unchanged.
 

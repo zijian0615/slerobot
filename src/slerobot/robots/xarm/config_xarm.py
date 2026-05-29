@@ -26,7 +26,7 @@ class XArmConfig(RobotConfig):
     """
 
     # ---- 连接 ----
-    robot_ip: str = "192.168.1.204"
+    robot_ip: str = "192.168.1.127"
 
     # ---- 自由度 ----
     robot_dof: int = 6  # 5, 6, or 7
