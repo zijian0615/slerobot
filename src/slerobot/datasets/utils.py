@@ -1108,6 +1108,36 @@ def build_dataset_frame(
     Returns:
         dict: A dictionary representing a single frame of data.
     """
+    def _as_feature_array(value: Any, ft: dict) -> np.ndarray:
+        shape = tuple(ft["shape"])
+        return np.asarray(value, dtype=np.dtype(ft["dtype"])).reshape(shape)
+
+    def _flatten_named_values(names: list[str], ft: dict) -> np.ndarray:
+        expected_size = int(np.prod(ft["shape"]))
+        packed_values = []
+        for name in names:
+            value = values.get(name, 0.0)
+            packed_values.extend(np.asarray(value, dtype=np.float32).reshape(-1).tolist())
+        if len(packed_values) < expected_size:
+            packed_values.extend([0.0] * (expected_size - len(packed_values)))
+        return np.asarray(packed_values[:expected_size], dtype=np.float32).reshape(tuple(ft["shape"]))
+
+    def _flatten_numeric_values(ft: dict) -> np.ndarray | None:
+        expected_size = int(np.prod(ft["shape"]))
+        packed_values = []
+        for value in values.values():
+            if isinstance(value, (str, bytes)):
+                continue
+            array = np.asarray(value)
+            if array.dtype.kind not in "biuf":
+                continue
+            packed_values.extend(array.astype(np.float32).reshape(-1).tolist())
+            if len(packed_values) >= expected_size:
+                break
+        if len(packed_values) != expected_size:
+            return None
+        return np.asarray(packed_values, dtype=np.float32).reshape(tuple(ft["shape"]))
+
     frame = {}
     for key, ft in ds_features.items():
         if key in DEFAULT_FEATURES or not key.startswith(prefix):
@@ -1115,14 +1145,15 @@ def build_dataset_frame(
         
         # Handle merged scalar features (e.g., "observation.state", "action")
         # These have dtype float32, a 1D shape, and a names list
-        if ft["dtype"] == "float32" and len(ft["shape"]) == 1 and ft["names"]:
-            # Merged feature with multiple scalar values
-            # Extract values by their names
-            try:
-                frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
-            except KeyError as e:
-                # Fill with zeros for missing values
-                frame[key] = np.array([values.get(name, 0.0) for name in ft["names"]], dtype=np.float32)
+        if is_valid_numpy_dtype_string(ft["dtype"]) and len(ft["shape"]) == 1:
+            if key in values:
+                frame[key] = _as_feature_array(values[key], ft)
+            elif ft.get("names"):
+                frame[key] = _flatten_named_values(ft["names"], ft)
+            else:
+                packed = _flatten_numeric_values(ft)
+                if packed is not None:
+                    frame[key] = packed
         
         # Handle image/video fields
         elif ft["dtype"] in ["image", "video"]:

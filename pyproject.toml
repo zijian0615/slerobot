@@ -27,6 +27,11 @@ kinematics = [
     "placo>=0.9.0",
     "scipy>=1.10",
 ]
+pybullet = [
+    # macOS arm64: PyPI 通常无 wheel，请优先 conda install -c conda-forge pybullet=3.25
+    "pybullet>=3.2.5",
+    "numpy>=1.20",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -43,3 +48,4 @@ slerobot-record = "slerobot.scripts.slerobot_record:record"
 slerobot-lekiwi-record = "slerobot.scripts.slerobot_lekiwi_record:record"
 slerobot-lekiwi-host = "slerobot.robots.lekiwi.lekiwi_host:main"
 slerobot-lekiwi-calibrate = "slerobot.scripts.slerobot_lekiwi_calibrate:main"
+slerobot-so100-tele = "slerobot.scripts.slerobot_so100_tele:teleoperate"

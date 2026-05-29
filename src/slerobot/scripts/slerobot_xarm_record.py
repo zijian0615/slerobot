@@ -18,14 +18,15 @@ xArm 数据采集脚本
     xArm qy = +qx_u   (X→-Y, 两次取反相消)
     xArm qz = -qy_u   (Y→Z, LH→RH反向)
 
-用法示例（笛卡尔模式 + Quest3s 遥操作）：
-    python slerobot_xarm_record.py \
+用法示例（笛卡尔模式 + Quest3s 遥操作 + OpenCV 相机）：
+    python -m slerobot.scripts.slerobot_xarm_record \
         --dataset.repo_id=zijian2022/xarm_demo \
         --dataset.single_task="pick and place" \
         --robot.robot_ip=192.168.1.204 \
         --robot.robot_dof=6 \
         --robot.robot_mode=7 \
         --robot.gripper_type=1 \
+        --robot.cameras='{"front": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 20}}' \
         --teleop.mqtt_broker=10.22.9.10
 
 用法示例（回放策略）：
@@ -52,6 +53,7 @@ from slerobot.configs.policies import PreTrainedConfig
 from slerobot.teleoperators import Teleoperator
 from slerobot.teleoperators.quest3s import Quest3sController
 from slerobot.robots import Robot
+from slerobot.cameras.utils import make_cameras_from_configs
 from slerobot.robots.xarm import XArmConfig, XArmRobot
 
 from slerobot.utils.constants import ACTION, OBS_STR
@@ -753,8 +755,12 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
         gripper_force=cfg.robot.gripper_force,
         start_joints=tuple(cfg.robot.start_joints),
         move_to_start_on_connect=cfg.robot.move_to_start_on_connect,
+        cameras=cfg.robot.cameras or {},
     )
     robot = XArmRobot(xarm_cfg)
+    if cfg.robot.cameras:
+        robot.cameras = make_cameras_from_configs(cfg.robot.cameras)
+        logging.info("Configured %d camera(s): %s", len(robot.cameras), list(robot.cameras.keys()))
 
     # ── 构建 Teleop ──
     teleop: Teleoperator | None = None
@@ -799,8 +805,16 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
         except Exception as exc:
             raise ValueError(f"Unsupported policy type: {cfg.policy.type}") from exc
 
-    # ── 数据集特征 ──
+    # ── 数据集特征（须在相机初始化之后，否则 observation.images.* 不会写入 schema）──
     dataset_features = combine_feature_dicts(robot.observation_features, robot.action_features)
+    video_feature_keys = [k for k, v in dataset_features.items() if v.get("dtype") == "video"]
+    if cfg.robot.cameras and not video_feature_keys:
+        logging.warning(
+            "Cameras are configured but dataset has no video features; "
+            "frames will not be saved as video."
+        )
+    elif video_feature_keys:
+        logging.info("Dataset will record video features: %s", video_feature_keys)
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
 
     dataset  = None
@@ -808,7 +822,7 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
     events   = None
 
     try:
-        num_cameras = len(robot.cameras) if robot.cameras else 1
+        num_cameras = len(robot.cameras) if robot.cameras else 0
 
         if cfg.resume:
             dataset = sLerobotDataset(

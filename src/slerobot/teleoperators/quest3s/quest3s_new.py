@@ -216,6 +216,10 @@ class Quest3sController(Teleoperator):
         for key in ("secondaryButton", "primaryButton"):
             if key in payload:
                 result[key] = payload[key]
+        # Unity 手部原始位置（米），供非 xArm 机器人（如 SO100）直接使用
+        for key in ("px", "py", "pz"):
+            if key in payload:
+                result[key] = float(payload[key])
         for key in ("qx", "qy", "qz", "qw"):
             if key in payload:
                 result[key] = float(payload[key])

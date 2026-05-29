@@ -199,9 +199,10 @@ class XArmRobot(Robot):
 
         self._connected = True
 
-        # 初始化相机
+        # 初始化相机（若 record 脚本已提前 make_cameras_from_configs，则只 connect）
         if self.config.cameras:
-            self.cameras = make_cameras_from_configs(self.config.cameras)
+            if not self.cameras:
+                self.cameras = make_cameras_from_configs(self.config.cameras)
             for cam in self.cameras.values():
                 cam.connect()
 
@@ -578,10 +579,20 @@ class XArmRobot(Robot):
 
         feats["j7"] = float  # gripper norm
 
-        for cam_name, camera in self.cameras.items():
-            h = camera.height if hasattr(camera, "height") else 480
-            w = camera.width if hasattr(camera, "width") else 640
-            feats[cam_name] = (h, w, 3)
+        if self.cameras:
+            for cam_name, camera in self.cameras.items():
+                h = camera.height if hasattr(camera, "height") and camera.height else 480
+                w = camera.width if hasattr(camera, "width") and camera.width else 640
+                feats[cam_name] = (h, w, 3)
+        elif self.config.cameras:
+            for cam_name, cam_cfg in self.config.cameras.items():
+                if isinstance(cam_cfg, dict):
+                    h = cam_cfg.get("height") or 480
+                    w = cam_cfg.get("width") or 640
+                else:
+                    h = cam_cfg.height or 480
+                    w = cam_cfg.width or 640
+                feats[cam_name] = (h, w, 3)
 
         return feats
 
