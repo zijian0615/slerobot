@@ -325,6 +325,36 @@ class XArmRobot(Robot):
         self.real_arm.set_state(0)
         time.sleep(0.3)
 
+    def move_to_home(self, speed_deg_s: float = 30.0) -> None:
+        """以低速平滑运动到 start_joints，用于 episode 间归位，避免下集开头跳变。
+
+        内部切换到 mode=0 执行同步运动，完成后恢复 self._mode。
+        speed_deg_s: 归位速度（度/秒），建议 20~50，越低越安全。
+        """
+        if not self._connected or self.real_arm is None:
+            return
+        logger.info("XArmRobot: moving to home (start_joints) at %.0f deg/s …", speed_deg_s)
+        speed_rad = math.radians(speed_deg_s)
+        # 切到普通位置模式执行同步运动
+        self.real_arm.set_mode(0)
+        self.real_arm.set_state(0)
+        time.sleep(0.1)
+        code = self.real_arm.set_servo_angle(
+            angle=list(self.config.start_joints),
+            speed=speed_rad,
+            mvacc=math.radians(200.0),
+            is_radian=True,
+            wait=True,
+        )
+        if code != 0:
+            logger.warning("move_to_home: set_servo_angle returned code=%d", code)
+        # 恢复目标模式
+        self.real_arm.set_mode(self._mode)
+        self.real_arm.set_state(0)
+        self._cmd_cnt = 0   # 重置计数，让 send_action 重新走首帧稳定逻辑
+        time.sleep(0.1)
+        logger.info("XArmRobot: home reached.")
+
     def disconnect(self) -> None:
         if not self._connected:
             return

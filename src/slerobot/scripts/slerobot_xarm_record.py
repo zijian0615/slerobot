@@ -439,7 +439,7 @@ def _teleop_to_xarm_action(
         has_valid_quat = (abs(qx_u) + abs(qy_u) + abs(qz_u) + abs(qw_u)) > 0.5
         q_cur_u = _unity_quat(qx_u, qy_u, qz_u, qw_u)
 
-        print(f"[DBG] robot_home_rot_deg={robot_home_rot_deg}")
+        #print(f"[DBG] robot_home_rot_deg={robot_home_rot_deg}")
         # if has_valid_quat and teleop_home_quat is not None and robot_home_rot_deg is not None:
         #     rrx, rry, rrz = (math.radians(d) for d in robot_home_rot_deg)
         #     q_delta_u = _qnorm(_qmul(_qconj(teleop_home_quat), q_cur_u))
@@ -532,6 +532,21 @@ def record_loop(
     play_sounds: bool = True,
     tts_voice: str | None = None,
     tts_rate: int | None = None,
+    # ── 推理平滑参数 ──
+    policy_ema_alpha: float = 0.3,
+    # EMA 平滑系数（仅策略推理时生效）：
+    #   0.0 = 完全平滑（不响应新动作），1.0 = 无平滑（直接发送原始输出）
+    #   推荐范围 0.2~0.5；振荡严重时调低（如 0.2），响应迟钝时调高
+    #   y[t] = alpha*x[t] + (1-alpha)*y[t-1]，alpha 越小，高频抖动衰减越强
+    policy_gripper_hyst_frames: int = 3,
+    # 夹爪迟滞帧数：连续 N 帧信号一致才切换开/关，避免夹爪反复抖动
+    policy_max_delta_pos_mm: float = 30.0,
+    # 每帧最大位置增量（mm）：硬限制策略输出的单帧跳变。
+    #   20fps × 30mm = 600mm/s 上限，超出部分直接截断。
+    #   设为 0.0 表示不限制。
+    policy_max_delta_rot_rad: float = 0.3,
+    # 每帧最大旋转增量（弧度）：对 r0..r5 的变化幅度做等效角度限制。
+    #   设为 0.0 表示不限制。
 ) -> None:
     """
     xArm 录制主循环。
@@ -567,6 +582,19 @@ def record_loop(
 
     _robot_home_pos     = robot_home_pos
     _robot_home_rot_deg = robot_home_rot_deg
+
+    # ── 策略推理平滑状态（仅 policy 模式下生效）──
+    _ema_action: dict | None = None          # EMA 平滑后的动作缓存
+    _grip_hyst_buf: list[float] = []         # 夹爪迟滞滑动窗口
+    _grip_hyst_state: float = 0.0            # 当前夹爪迟滞输出
+
+    # ── 关节连续性诊断状态 ──
+    # 每帧读真实关节角，累计每秒内最大单帧关节跳变；用于定性判断
+    # "固件 IK branch flip" vs "策略笛卡尔输出振荡"。
+    _diag_prev_joints: np.ndarray | None = None
+    _diag_max_dq_deg = 0.0                    # 本秒窗口内最大单帧关节跳变（度）
+    _diag_max_dq_joint = -1                   # 发生最大跳变的关节索引
+    _diag_max_dq_cart: tuple | None = None    # 跳变时命令的笛卡尔位置（用于对照）
 
     # ── teleop_home_quat：首帧自动从 MQTT 读取，无需手动配置 ──
     # 保存 Unity 原始四元数；旋转 delta 在 _quest_local_rot_delta_to_xarm() 中做轴映射。
@@ -719,7 +747,63 @@ def record_loop(
 
         # ── 构造 xArm 动作 ──
         if policy is not None and act_processed_policy is not None:
-            robot_action_to_send   = robot_action_processor((act_processed_policy, obs))
+            robot_action_to_send = robot_action_processor((act_processed_policy, obs))
+
+            # ── Step1: Delta Clamping（硬限制单帧跳变，先于 EMA 执行）──
+            if _ema_action is not None:
+                _pos_keys = ("j0", "j1", "j2")
+                _rot6d_ks = ("r0", "r1", "r2", "r3", "r4", "r5")
+                clamped = dict(robot_action_to_send)
+
+                # 位置：每轴独立截断
+                if policy_max_delta_pos_mm > 0.0:
+                    for k in _pos_keys:
+                        if k in clamped and k in _ema_action:
+                            raw  = float(clamped[k])
+                            prev = float(_ema_action[k])
+                            delta = raw - prev
+                            if abs(delta) > policy_max_delta_pos_mm:
+                                clamped[k] = prev + math.copysign(policy_max_delta_pos_mm, delta)
+
+                # 旋转（6D）：用 Frobenius 范数衡量整体旋转变化量
+                if policy_max_delta_rot_rad > 0.0 and all(k in clamped for k in _rot6d_ks):
+                    rot_delta = sum(
+                        (float(clamped[k]) - float(_ema_action.get(k, clamped[k]))) ** 2
+                        for k in _rot6d_ks
+                    ) ** 0.5
+                    if rot_delta > policy_max_delta_rot_rad:
+                        scale = policy_max_delta_rot_rad / rot_delta
+                        for k in _rot6d_ks:
+                            prev = float(_ema_action.get(k, clamped[k]))
+                            clamped[k] = prev + (float(clamped[k]) - prev) * scale
+
+                robot_action_to_send = clamped
+
+            # ── Step2: EMA 平滑（在 delta clamp 之后，进一步平滑残余抖动）──
+            alpha = policy_ema_alpha
+            if _ema_action is None:
+                _ema_action = dict(robot_action_to_send)
+            else:
+                for k, v in robot_action_to_send.items():
+                    if k == "j7":
+                        continue  # 夹爪单独用迟滞处理
+                    prev = _ema_action.get(k, v)
+                    _ema_action[k] = alpha * float(v) + (1.0 - alpha) * float(prev)
+
+            # ── 夹爪迟滞（连续 N 帧一致才切换）──
+            raw_grip = float(robot_action_to_send.get("j7", _grip_hyst_state))
+            _grip_hyst_buf.append(raw_grip)
+            if len(_grip_hyst_buf) > policy_gripper_hyst_frames:
+                _grip_hyst_buf.pop(0)
+            grip_signal = sum(_grip_hyst_buf) / len(_grip_hyst_buf)
+            if grip_signal > 0.6:
+                _grip_hyst_state = 1.0
+            elif grip_signal < 0.4:
+                _grip_hyst_state = 0.0
+            # 否则保持上一帧状态（迟滞区间内不切换）
+            _ema_action["j7"] = _grip_hyst_state
+
+            robot_action_to_send = _ema_action
             action_values_for_dataset = dict(act_processed_policy)
         else:
             raw_teleop_action = dict(act_processed_teleop or {})
@@ -737,14 +821,74 @@ def record_loop(
                 time.sleep(max(target_dt - elapsed, 0.0))
                 continue
             robot_action_to_send      = robot_action_processor((xarm_action, obs))
+
+            # ── 遥操 EMA 平滑（与推理同一系数 alpha；j7 夹爪直通不平滑）──
+            alpha = policy_ema_alpha
+            if _ema_action is None:
+                _ema_action = dict(robot_action_to_send)
+            else:
+                for k, v in robot_action_to_send.items():
+                    if k == "j7":
+                        _ema_action[k] = float(v)
+                        continue
+                    prev = _ema_action.get(k, v)
+                    _ema_action[k] = alpha * float(v) + (1.0 - alpha) * float(prev)
+            robot_action_to_send      = dict(_ema_action)
             action_values_for_dataset = dict(robot_action_to_send)
+
+        # ── 关节连续性诊断：每帧读真实关节角，累计本秒最大单帧跳变 ──
+        # 笛卡尔模式下机械臂仍有真实关节状态；固件若 branch flip，
+        # 会表现为"命令笛卡尔连续、但关节角突跳"。
+        _real_arm = getattr(robot, "real_arm", None)
+        if _real_arm is not None:
+            try:
+                _code, _cur_joints = _real_arm.get_servo_angle(is_radian=True)
+                if _code == 0 and _cur_joints is not None:
+                    _cur_joints = np.asarray(_cur_joints[:robot_dof], dtype=float)
+                    if _diag_prev_joints is not None:
+                        _dq = np.abs(_cur_joints - _diag_prev_joints)
+                        _j_idx = int(np.argmax(_dq))
+                        _dq_deg = math.degrees(float(_dq[_j_idx]))
+                        if _dq_deg > _diag_max_dq_deg:
+                            _diag_max_dq_deg = _dq_deg
+                            _diag_max_dq_joint = _j_idx
+                            _diag_max_dq_cart = (
+                                float(robot_action_to_send.get("j0", 0.0)),
+                                float(robot_action_to_send.get("j1", 0.0)),
+                                float(robot_action_to_send.get("j2", 0.0)),
+                            )
+                    _diag_prev_joints = _cur_joints
+            except Exception as _exc:
+                logging.debug("[diag] get_servo_angle failed: %s", _exc)
 
         # ── 调试打印最终发送值（每秒最多 1 次）──
         _send_dbg_last = getattr(record_loop, "_send_dbg_last", 0.0)
         if time.perf_counter() - _send_dbg_last > 1.0:
             keys = sorted([k for k in robot_action_to_send if k.startswith("j")])
             vals = "  ".join(f"{k}={robot_action_to_send[k]:+.3f}" for k in keys)
+            # 当前真实关节角（度）
+            if _diag_prev_joints is not None:
+                joints_deg = "  ".join(
+                    f"q{i}={math.degrees(v):+.1f}" for i, v in enumerate(_diag_prev_joints)
+                )
+            else:
+                joints_deg = "n/a"
+            # 本秒窗口内最大单帧关节跳变
+            if _diag_max_dq_cart is not None:
+                cx, cy, cz = _diag_max_dq_cart
+                dq_info = (
+                    f"max_dq={_diag_max_dq_deg:.1f}deg @q{_diag_max_dq_joint} "
+                    f"(cmd_cart={cx:+.0f},{cy:+.0f},{cz:+.0f})"
+                )
+            else:
+                dq_info = f"max_dq={_diag_max_dq_deg:.1f}deg"
             print(f"[SEND] {vals}", flush=True)
+            print(f"[JOINTS] {joints_deg}", flush=True)
+            print(f"[DIAG] {dq_info}", flush=True)
+            # 重置本秒窗口
+            _diag_max_dq_deg = 0.0
+            _diag_max_dq_joint = -1
+            _diag_max_dq_cart = None
             record_loop._send_dbg_last = time.perf_counter()
 
         # ── 发送动作 ──
@@ -1079,6 +1223,14 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                         robot_home_pos=resolved_robot_home_pos,
                         robot_home_rot_deg=resolved_robot_home_rot_deg,
                     )
+
+                # reset 结束后自动归位，消除下集开头的跳变
+                if not events["stop_recording"]:
+                    log_say(
+                        "Returning to home position",
+                        cfg.play_sounds, voice=cfg.tts_voice, rate=cfg.tts_rate,
+                    )
+                    robot.move_to_home(speed_deg_s=30.0)
 
                 if events["rerecord_episode"]:
                     log_say(
