@@ -111,7 +111,9 @@ class XArmRobot(Robot):
     xArm 机器人接口，实现 slerobot Robot 协议。
 
     支持两种运动模式：
-        mode=6 (joint servo)    : action/observation 均为关节角度，键名 j0…j(dof-1) + j7(gripper)
+        mode=1 (cartesian offline): action/observation 为笛卡尔位姿 [x,y,z,rx,ry,rz] (radians)，
+                                   键名 j0(x)…j5(rz) + j7(gripper)
+        mode=6 (joint online)    : action/observation 均为关节角度，键名 j0…j(dof-1) + j7(gripper)
         mode=7 (cartesian online): action/observation 为笛卡尔位姿 [x,y,z,rx,ry,rz] (radians)，
                                    键名 j0(x)…j5(rz) + j7(gripper)
 
@@ -129,6 +131,10 @@ class XArmRobot(Robot):
         self._mode = config.robot_mode
         self._gripper_type = GripperType(config.gripper_type)
         self._cmd_cnt = 0
+        # mode=1 伺服重稳定标志：置 True 时，下一次 send_action 会先以当前真实
+        # 位姿"原地踏步"若干帧，再恢复目标跟踪。用于 move_to_home 后或离合接合
+        # 时，避免伺服高增益控制器首帧猛追导致机械臂飘逸。
+        self._servo_restab = True
 
         self._joint_speed = math.radians(config.robot_speed)
         self._joint_acc = math.radians(config.robot_acc)
@@ -325,6 +331,11 @@ class XArmRobot(Robot):
         self.real_arm.set_state(0)
         time.sleep(0.3)
 
+    def request_servo_restabilize(self) -> None:
+        """请求下一次 send_action 先做 mode=1 伺服重稳定（原地踏步），
+        用于离合接合等需要避免伺服首帧猛追的场景。"""
+        self._servo_restab = True
+
     def move_to_home(self, speed_deg_s: float = 30.0) -> None:
         """以低速平滑运动到 start_joints，用于 episode 间归位，避免下集开头跳变。
 
@@ -351,7 +362,8 @@ class XArmRobot(Robot):
         # 恢复目标模式
         self.real_arm.set_mode(self._mode)
         self.real_arm.set_state(0)
-        self._cmd_cnt = 0   # 重置计数，让 send_action 重新走首帧稳定逻辑
+        self._cmd_cnt = 0
+        self._servo_restab = True   # 让下次 send_action 重走 mode=1 首帧稳定逻辑
         time.sleep(0.1)
         logger.info("XArmRobot: home reached.")
 
@@ -581,13 +593,14 @@ class XArmRobot(Robot):
             # mode=1: Cartesian servo（笛卡尔伺服，每帧直接覆盖目标位置，无轨迹队列）
             pose = self._action_to_pose(action)
 
-            if self.real_arm.mode != 1:
-                # 切换到 Cartesian servo 模式
-                self.real_arm.set_mode(1)
-                self.real_arm.set_state(0)
-                time.sleep(0.1)
-                # 进入 servo 后，先以当前真实位置"原地踏步"若干帧
-                # 防止 servo 高增益控制器因首帧微小偏差产生剧烈抖动
+            if self.real_arm.mode != 1 or self._servo_restab:
+                # 切换到 Cartesian servo 模式（若已在 mode=1 则只做重稳定）
+                if self.real_arm.mode != 1:
+                    self.real_arm.set_mode(1)
+                    self.real_arm.set_state(0)
+                    time.sleep(0.1)
+                # 进入 servo / 重稳定时，先以当前真实位置"原地踏步"若干帧，
+                # 防止 servo 高增益控制器因首帧偏差产生剧烈抖动/飘逸。
                 _, cur_pose = self.real_arm.get_position_aa(is_radian=True)
                 if cur_pose is not None:
                     for _ in range(5):
@@ -598,6 +611,7 @@ class XArmRobot(Robot):
                             mvacc=self.config.robot_acc,
                         )
                         time.sleep(0.01)
+                self._servo_restab = False
             self.real_arm.set_servo_cartesian_aa(
                 pose,
                 is_radian=True,

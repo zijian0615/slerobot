@@ -45,7 +45,9 @@ src/slerobot/test/private.py
 # Data & artifacts
 data/
 datasets/
+input/
 outputs/
+camera_snapshots/
 checkpoints/
 logs/
 *.mp4

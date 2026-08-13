@@ -144,7 +144,7 @@ class XArmRobotConfig:
     gripper_port: str | None = None
     gripper_speed: int = -1
     gripper_force: int = -1
-    start_joints: tuple = (0.0, 0.0, -1.5708, 0.0, 1.5708, 0.0)
+    start_joints: tuple = (-0.16828, -0.44685, -0.89340, -0.15272, 1.34873, -0.03999)
     # 设为 False 可阻止 connect() 时机械臂自动运动到 start_joints
     move_to_start_on_connect: bool = True
     cameras: dict[str, Any] | None = None
@@ -183,7 +183,7 @@ class RecordConfig:
     robot: XArmRobotConfig = field(default_factory=XArmRobotConfig)
     teleop: Quest3sConfig | None = None
     policy: PreTrainedConfig | None = None
-    display_data: bool = False
+    display_data: bool = True
     display_ip: str | None = None
     display_port: int | None = None
     display_compressed_images: bool = False
@@ -193,6 +193,16 @@ class RecordConfig:
     resume: bool = False
     enable_attention_visualization: bool = False
     realtime_attention_display: bool = False
+    # ── 动作平滑（EMA）系数，遥操与推理共用 ──
+    # 0.0 = 完全平滑（不响应新动作），1.0 = 无平滑（原始输出直通）
+    # 推荐 0.2~0.5；越小越平滑越滞后。训练与推理应保持一致。
+    ema_alpha: float = 0.3
+    # A 键回零速度（度/秒）：遥操时按手柄 A 键，机械臂低速自主回到 start_joints
+    home_button_speed_deg_s: float = 30.0
+    # ── 纯遥操模式（不录制数据）──
+    # True 时：照常连接机器人/相机/遥操、照常可视化和归位，
+    #          但不创建数据集、不写帧、不保存、不上传。用于试机/热身/标定。
+    free_teleop: bool = False
 
     def __post_init__(self):
         policy_path = parser.get_path_arg("policy")
@@ -203,6 +213,9 @@ class RecordConfig:
 
         if self.teleop is None and self.policy is None:
             raise ValueError("Choose a policy, a teleoperator or both to control the robot")
+
+        if self.free_teleop and self.teleop is None:
+            raise ValueError("free_teleop=True 需要遥操作设备，请提供 --teleop 参数。")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -439,15 +452,6 @@ def _teleop_to_xarm_action(
         has_valid_quat = (abs(qx_u) + abs(qy_u) + abs(qz_u) + abs(qw_u)) > 0.5
         q_cur_u = _unity_quat(qx_u, qy_u, qz_u, qw_u)
 
-        #print(f"[DBG] robot_home_rot_deg={robot_home_rot_deg}")
-        # if has_valid_quat and teleop_home_quat is not None and robot_home_rot_deg is not None:
-        #     rrx, rry, rrz = (math.radians(d) for d in robot_home_rot_deg)
-        #     q_delta_u = _qnorm(_qmul(_qconj(teleop_home_quat), q_cur_u))
-        #     q_delta_xarm = _unity_delta_quat_to_xarm(q_delta_u)   # ← 新函数
-        #     R_delta_x = _q_to_mat3(q_delta_xarm)
-        #     R_robot_home = _aa_to_mat3(rrx, rry, rrz)
-        #     R_tgt = R_robot_home @ R_delta_x
-        #     j3, j4, j5 = _mat3_to_aa(R_tgt)
         if has_valid_quat and teleop_home_quat is not None and robot_home_rot_deg is not None:
             rrx, rry, rrz = (math.radians(d) for d in robot_home_rot_deg)
             q_delta_u = _qnorm(_qmul(_qconj(teleop_home_quat), q_cur_u))
@@ -532,6 +536,8 @@ def record_loop(
     play_sounds: bool = True,
     tts_voice: str | None = None,
     tts_rate: int | None = None,
+    # A 键回零速度（度/秒）：按下手柄 A 键时机械臂低速自主回到 start_joints
+    home_button_speed_deg_s: float = 30.0,
     # ── 推理平滑参数 ──
     policy_ema_alpha: float = 0.3,
     # EMA 平滑系数（仅策略推理时生效）：
@@ -587,22 +593,30 @@ def record_loop(
     _ema_action: dict | None = None          # EMA 平滑后的动作缓存
     _grip_hyst_buf: list[float] = []         # 夹爪迟滞滑动窗口
     _grip_hyst_state: float = 0.0            # 当前夹爪迟滞输出
-
-    # ── 关节连续性诊断状态 ──
-    # 每帧读真实关节角，累计每秒内最大单帧关节跳变；用于定性判断
-    # "固件 IK branch flip" vs "策略笛卡尔输出振荡"。
-    _diag_prev_joints: np.ndarray | None = None
-    _diag_max_dq_deg = 0.0                    # 本秒窗口内最大单帧关节跳变（度）
-    _diag_max_dq_joint = -1                   # 发生最大跳变的关节索引
-    _diag_max_dq_cart: tuple | None = None    # 跳变时命令的笛卡尔位置（用于对照）
+    _prev_a_button: int = 0                  # A 键上一帧状态，用于上升沿检测
 
     # ── teleop_home_quat：首帧自动从 MQTT 读取，无需手动配置 ──
     # 保存 Unity 原始四元数；旋转 delta 在 _quest_local_rot_delta_to_xarm() 中做轴映射。
     _teleop_home_quat: np.ndarray | None = None
 
-    # home 捕获后跳过若干帧，等待手势稳定，避免首帧大幅跳变
-    _home_capture_skip = 0
-    _HOME_SKIP_FRAMES  = 10   # 增加到 10 帧，给 servo 模式稳定更多时间
+    # trigger 离合器状态：上一帧 trigger 是否按下，用于上升/下降沿检测。
+    # 离合语义见下方 teleop 分支：按住才动、每次按下在当前位姿重新锚定 home。
+    _prev_trigger: int = 0
+    # 接合稳定窗口：trigger 上升沿后先冻结若干帧再锚定 home。
+    # 扣扳机动作本身会把手柄拉动几厘米，立即锚定会让随后的捏合抖动被
+    # 映射成机械臂运动。等手柄沉定后再锚定 → 真正零突跳。
+    # 接合稳定判据：trigger 按下后，必须等手柄位置【真正稳定】才锚定 home。
+    # Quest 在每集开头追踪未收敛，position 可能是垃圾值并持续漂移几百 mm，
+    # 死数帧数会锚到漂移中的错误 home → 真实值回归时机械臂窜跳。
+    # 故改为：连续帧位移 < STABLE_EPS_MM 视为稳定；越界值直接丢弃；
+    # 超过 MAX_WAIT 帧仍不稳定则放弃本次接合（不动、不录）。
+    _clutch_prev_pos: tuple | None = None   # 上一帧手柄位置，用于判稳
+    _clutch_stable_cnt: int = 0             # 已连续稳定帧数
+    _clutch_wait: int = 0                   # 自上升沿起已等待帧数
+    _CLUTCH_STABLE_EPS_MM: float = 8.0      # 相邻帧位移阈值（mm）
+    _CLUTCH_STABLE_NEED: int = 4            # 需连续稳定帧数
+    _CLUTCH_MAX_WAIT: int = 60              # 最多等待帧数（≈3s @20Hz）
+    _CLUTCH_POS_LIMIT_MM: float = 1500.0    # |x|,|y|,|z| 超过即判定垃圾值
 
     while True:
         loop_start = time.perf_counter()
@@ -710,28 +724,144 @@ def record_loop(
                 )
                 record_loop._mqtt_dbg_last = time.perf_counter()
 
-            # ── 首帧自动记录 teleop_home 四元数（Unity 原始值）──
+            # ── A 键回零（上升沿触发，工业 return-to-home 实践）──
+            #   1) 低速自主回到 start_joints（不再跟手）
+            #   2) 重设遥操基准：位置=当前手柄位置、旋转=下一帧重新捕获
+            #   3) 清空 EMA，避免恢复跟手时机械臂瞬间弹回旧目标
+            _btns = raw_act.get("buttons", {}) if isinstance(raw_act, dict) else {}
+            _a_now = int(_btns.get("a", 0)) if isinstance(_btns, dict) else 0
+            if _a_now and not _prev_a_button:
+                log_say("Returning to home", play_sounds, voice=tts_voice, rate=tts_rate)
+                logging.info(
+                    "[xArm Record] A 键触发：以 %.0f deg/s 低速回零并重设遥操基准。",
+                    home_button_speed_deg_s,
+                )
+                robot.move_to_home(speed_deg_s=home_button_speed_deg_s)
+                # 清空基准：回零后需重新按下 trigger 才接合并重新锚定 home。
+                _teleop_home_quat = None
+                _ema_action = None                    # 清空 EMA 残留
+                _prev_trigger = 0                     # 强制下一次按下视为上升沿
+                _prev_a_button = _a_now
+                timestamp = time.perf_counter() - start_episode_t
+                continue
+            _prev_a_button = _a_now
+
+            # ── trigger 离合器（clutch）：工业标准遥操接合方式 ──
+            #   • 按住 trigger 才驱动机械臂；松开则冻结（不发动作、不录帧）。
+            #   • 每次按下（上升沿）以「当前手柄位姿」为原点重新锚定 home →
+            #     delta=0，机械臂纹丝不动；之后按住移动才相对跟随。
+            #   • 松开时清空 home，下次按下在新位置重新锚定 → 永不突跳，
+            #     集与集之间手柄漂到哪都无所谓。
+            _trigger_now = int(_btns.get("trigger", 0)) if isinstance(_btns, dict) else 0
+
+            if not _trigger_now:
+                # 离合断开：冻结机械臂（不发动作）+ 暂停录制（不录帧）
+                if _prev_trigger:
+                    logging.info("[xArm Record] 松开 trigger：离合断开，机械臂冻结，暂停录制。")
+                _teleop_home_quat = None   # 清空基准，下次按下重新锚定
+                _ema_action = None
+                _clutch_prev_pos   = None  # 重置稳定判定
+                _clutch_stable_cnt = 0
+                _clutch_wait       = 0
+                _prev_trigger = _trigger_now
+                timestamp = time.perf_counter() - start_episode_t
+                elapsed   = time.perf_counter() - loop_start
+                time.sleep(max(target_dt - elapsed, 0.0))
+                continue
+
+            # 上升沿（0→1）：进入稳定判定，重置计数
+            if not _prev_trigger and _teleop_home_quat is None:
+                _clutch_prev_pos   = None
+                _clutch_stable_cnt = 0
+                _clutch_wait       = 0
+                logging.info(
+                    "[xArm Record] 按下 trigger：等手柄追踪收敛且位置稳定后再锚定 home …",
+                )
+
+            # ── 锚定前的稳定门控：手柄位置必须【在合理范围 + 连续稳定】才锚定 ──
+            #   Quest 每集开头追踪未收敛，position 是垃圾值并持续漂移几百 mm；
+            #   死数帧数会锚到漂移中的错误 home → 真实值回归时机械臂窜跳。
             if _teleop_home_quat is None:
                 qx_h = float(raw_act.get("qx", 0.0))
                 qy_h = float(raw_act.get("qy", 0.0))
                 qz_h = float(raw_act.get("qz", 0.0))
                 qw_h = float(raw_act.get("qw", 1.0))
-                if abs(qx_h) + abs(qy_h) + abs(qz_h) + abs(qw_h) > 0.5:
-                    _teleop_home_quat = _unity_quat(qx_h, qy_h, qz_h, qw_h)
-                    _home_capture_skip = _HOME_SKIP_FRAMES
-                    logging.info(
-                        "[xArm Record] teleop_home_quat(Unity) 已从首帧读取："
-                        "[%.4f, %.4f, %.4f, %.4f]，跳过前 %d 帧等待手势稳定",
-                        *_teleop_home_quat, _HOME_SKIP_FRAMES,
+                _pos_h = raw_act.get("position", {})
+                _cur_pos = None
+                if isinstance(_pos_h, dict):
+                    _cur_pos = (
+                        float(_pos_h.get("x", 0.0)),
+                        float(_pos_h.get("y", 0.0)),
+                        float(_pos_h.get("z", 0.0)),
                     )
 
-            # home 刚捕获后的稳定跳过帧
-            if _home_capture_skip > 0:
-                _home_capture_skip -= 1
-                timestamp = time.perf_counter() - start_episode_t
-                elapsed   = time.perf_counter() - loop_start
-                time.sleep(max(target_dt - elapsed, 0.0))
-                continue
+                _quat_bad = abs(qx_h) + abs(qy_h) + abs(qz_h) + abs(qw_h) <= 0.5
+                _pos_oor = _cur_pos is None or any(
+                    abs(c) > _CLUTCH_POS_LIMIT_MM for c in _cur_pos
+                )
+
+                _settled = False
+                if not _quat_bad and not _pos_oor:
+                    if _clutch_prev_pos is not None:
+                        _d = sum((a - b) ** 2 for a, b in zip(_cur_pos, _clutch_prev_pos)) ** 0.5
+                        if _d <= _CLUTCH_STABLE_EPS_MM:
+                            _clutch_stable_cnt += 1
+                        else:
+                            _clutch_stable_cnt = 0   # 漂移中，稳定计数清零
+                    _clutch_prev_pos = _cur_pos
+                    _settled = _clutch_stable_cnt >= _CLUTCH_STABLE_NEED
+                else:
+                    _clutch_prev_pos   = None
+                    _clutch_stable_cnt = 0
+
+                _clutch_wait += 1
+                if not _settled:
+                    if _clutch_wait >= _CLUTCH_MAX_WAIT:
+                        # 超时仍不稳定 → 放弃本次接合，提示重新按下
+                        if _clutch_wait == _CLUTCH_MAX_WAIT:
+                            logging.warning(
+                                "[xArm Record] 手柄位置 %.0f 帧仍未稳定（垃圾/漂移），"
+                                "本次不接合，请松开 trigger 重按。",
+                                _clutch_wait,
+                            )
+                    # 未稳定：冻结机械臂（不发、不录），等下一帧
+                    _prev_trigger = _trigger_now
+                    timestamp = time.perf_counter() - start_episode_t
+                    elapsed   = time.perf_counter() - loop_start
+                    time.sleep(max(target_dt - elapsed, 0.0))
+                    continue
+
+                # ── 已稳定：以当前帧位姿锚定 home ──
+                _teleop_home_quat = _unity_quat(qx_h, qy_h, qz_h, qw_h)
+                teleop_home_pos = _cur_pos
+                # ── 解耦关键：robot_home 同步锚到机械臂【当前实际位姿】──
+                #   而非固定 start_joints。这样接合瞬间 delta=0 →
+                #   target=机械臂当前位姿 → 原地不动，无论它此刻停在哪都不跳。
+                from slerobot.robots.xarm.xarm import _rot6d_to_aa as _r6_to_aa, _ROT6D_KEYS as _R6K
+                if all(k in obs for k in ("j0", "j1", "j2")):
+                    _robot_home_pos = (
+                        float(obs["j0"]), float(obs["j1"]), float(obs["j2"]),
+                    )
+                if all(k in obs for k in _R6K):
+                    _rhx, _rhy, _rhz = _r6_to_aa(
+                        float(obs["r0"]), float(obs["r1"]), float(obs["r2"]),
+                        float(obs["r3"]), float(obs["r4"]), float(obs["r5"]),
+                    )
+                    _robot_home_rot_deg = (
+                        math.degrees(_rhx), math.degrees(_rhy), math.degrees(_rhz),
+                    )
+                _ema_action = None   # 从当前位姿干净起步
+                # 离合接合：请求伺服重稳定，避免 mode=1 高增益首帧猛追导致飘逸
+                if hasattr(robot, "request_servo_restabilize"):
+                    robot.request_servo_restabilize()
+                logging.info(
+                    "[xArm Record] 按下 trigger：离合接合（零突跳）。"
+                    "teleop_home pos=%s quat=[%.4f, %.4f, %.4f, %.4f]；"
+                    "robot_home pos=%s rot_deg=%s",
+                    teleop_home_pos, *_teleop_home_quat,
+                    _robot_home_pos, _robot_home_rot_deg,
+                )
+            _prev_trigger = _trigger_now
 
             act_processed_teleop = teleop_action_processor((raw_act, obs))
 
@@ -822,7 +952,13 @@ def record_loop(
                 continue
             robot_action_to_send      = robot_action_processor((xarm_action, obs))
 
-            # ── 遥操 EMA 平滑（与推理同一系数 alpha；j7 夹爪直通不平滑）──
+            # ── 方案 B：把 EMA 当作"下游控制器"。──
+            #   记录的是平滑【前】的原始意图（作为训练标签），
+            #   实际发送的是平滑【后】的动作。这样训练执行 = EMA(标签)、
+            #   推理执行 = EMA(policy输出)，两边恰好各一层 EMA，训推一致。
+            #   故 ema_alpha 训练与推理必须相同。
+            action_values_for_dataset = dict(robot_action_to_send)  # 平滑前 = 标签
+
             alpha = policy_ema_alpha
             if _ema_action is None:
                 _ema_action = dict(robot_action_to_send)
@@ -833,62 +969,14 @@ def record_loop(
                         continue
                     prev = _ema_action.get(k, v)
                     _ema_action[k] = alpha * float(v) + (1.0 - alpha) * float(prev)
-            robot_action_to_send      = dict(_ema_action)
-            action_values_for_dataset = dict(robot_action_to_send)
+            robot_action_to_send      = dict(_ema_action)  # 平滑后 = 发送
 
-        # ── 关节连续性诊断：每帧读真实关节角，累计本秒最大单帧跳变 ──
-        # 笛卡尔模式下机械臂仍有真实关节状态；固件若 branch flip，
-        # 会表现为"命令笛卡尔连续、但关节角突跳"。
-        _real_arm = getattr(robot, "real_arm", None)
-        if _real_arm is not None:
-            try:
-                _code, _cur_joints = _real_arm.get_servo_angle(is_radian=True)
-                if _code == 0 and _cur_joints is not None:
-                    _cur_joints = np.asarray(_cur_joints[:robot_dof], dtype=float)
-                    if _diag_prev_joints is not None:
-                        _dq = np.abs(_cur_joints - _diag_prev_joints)
-                        _j_idx = int(np.argmax(_dq))
-                        _dq_deg = math.degrees(float(_dq[_j_idx]))
-                        if _dq_deg > _diag_max_dq_deg:
-                            _diag_max_dq_deg = _dq_deg
-                            _diag_max_dq_joint = _j_idx
-                            _diag_max_dq_cart = (
-                                float(robot_action_to_send.get("j0", 0.0)),
-                                float(robot_action_to_send.get("j1", 0.0)),
-                                float(robot_action_to_send.get("j2", 0.0)),
-                            )
-                    _diag_prev_joints = _cur_joints
-            except Exception as _exc:
-                logging.debug("[diag] get_servo_angle failed: %s", _exc)
-
-        # ── 调试打印最终发送值（每秒最多 1 次）──
+        # ── 调试打印最终发送值（每秒最多 1 次，轻量，无网络往返）──
         _send_dbg_last = getattr(record_loop, "_send_dbg_last", 0.0)
         if time.perf_counter() - _send_dbg_last > 1.0:
             keys = sorted([k for k in robot_action_to_send if k.startswith("j")])
             vals = "  ".join(f"{k}={robot_action_to_send[k]:+.3f}" for k in keys)
-            # 当前真实关节角（度）
-            if _diag_prev_joints is not None:
-                joints_deg = "  ".join(
-                    f"q{i}={math.degrees(v):+.1f}" for i, v in enumerate(_diag_prev_joints)
-                )
-            else:
-                joints_deg = "n/a"
-            # 本秒窗口内最大单帧关节跳变
-            if _diag_max_dq_cart is not None:
-                cx, cy, cz = _diag_max_dq_cart
-                dq_info = (
-                    f"max_dq={_diag_max_dq_deg:.1f}deg @q{_diag_max_dq_joint} "
-                    f"(cmd_cart={cx:+.0f},{cy:+.0f},{cz:+.0f})"
-                )
-            else:
-                dq_info = f"max_dq={_diag_max_dq_deg:.1f}deg"
             print(f"[SEND] {vals}", flush=True)
-            print(f"[JOINTS] {joints_deg}", flush=True)
-            print(f"[DIAG] {dq_info}", flush=True)
-            # 重置本秒窗口
-            _diag_max_dq_deg = 0.0
-            _diag_max_dq_joint = -1
-            _diag_max_dq_cart = None
             record_loop._send_dbg_last = time.perf_counter()
 
         # ── 发送动作 ──
@@ -939,6 +1027,12 @@ def record_loop(
             if _ui_telemetry_enabled():
                 push_live_telemetry(obs, robot_action_to_send, step=rerun_step, **common_kwargs)
             else:
+                # 每秒打印 obs 里的图像键，确认相机帧是否真的进了 obs
+                # 注意：last_diagnostic_time 由本迭代稍后的 [FPS] 诊断块统一重置
+                if time.perf_counter() - last_diagnostic_time >= 1.0:
+                    img_keys = [k for k, v in obs.items()
+                                if isinstance(v, np.ndarray) and v.ndim >= 2]
+                    print(f"[RERUN] obs image keys = {img_keys}", flush=True)
                 log_rerun_data(obs, robot_action_to_send, control_step=rerun_step, **common_kwargs)
             rerun_step += 1
 
@@ -1040,7 +1134,10 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
         dataset_features = combine_feature_dicts(robot.observation_features, robot.action_features)
         num_cameras = len(robot.cameras) if robot.cameras else 1
 
-        if cfg.resume:
+        if cfg.free_teleop:
+            logging.info("[xArm Record] free_teleop=True：纯遥操模式，不创建数据集、不录制。")
+            dataset = None
+        elif cfg.resume:
             dataset = sLerobotDataset(
                 repo_id=cfg.dataset.repo_id,
                 root=cfg.dataset.root,
@@ -1145,8 +1242,10 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
             )
             logging.info("Attention visualizations will be saved to: %s", attention_output_dir)
 
-        # ── 录制循环 ──
-        with VideoEncodingManager(dataset):
+        # ── 录制循环 ──（纯遥操模式无数据集，用 nullcontext 占位）
+        import contextlib
+        _encoding_ctx = VideoEncodingManager(dataset) if dataset is not None else contextlib.nullcontext()
+        with _encoding_ctx:
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 log_say(
@@ -1172,7 +1271,7 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                     display_compressed_images=cfg.display_compressed_images,
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
-                    record_data=True,
+                    record_data=not cfg.free_teleop,
                     attention_visualization_enabled=attention_visualization_enabled,
                     attention_output_dir=attention_output_dir,
                     realtime_attention_display=cfg.realtime_attention_display,
@@ -1183,6 +1282,8 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                     teleop_home_rot_deg=cfg.robot.teleop_home_rot_deg,
                     robot_home_pos=resolved_robot_home_pos,
                     robot_home_rot_deg=resolved_robot_home_rot_deg,
+                    policy_ema_alpha=cfg.ema_alpha,
+                    home_button_speed_deg_s=cfg.home_button_speed_deg_s,
                 )
 
                 need_reset = not events["stop_recording"] and (
@@ -1222,15 +1323,20 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                         teleop_home_rot_deg=cfg.robot.teleop_home_rot_deg,
                         robot_home_pos=resolved_robot_home_pos,
                         robot_home_rot_deg=resolved_robot_home_rot_deg,
+                        policy_ema_alpha=cfg.ema_alpha,
+                    home_button_speed_deg_s=cfg.home_button_speed_deg_s,
                     )
 
-                # reset 结束后自动归位，消除下集开头的跳变
+                # reset 阶段由操作者用 A 键自主归位（见 record_loop 内 A 键逻辑）：
+                #   • 在结束本集、准备下集的过程中，按 A → 机械臂低速回到 home；
+                #   • 回零后离合断开（未按 trigger），机械臂保持该位姿静止不动，
+                #     直到下一集按下 trigger 才重新接合；
+                #   • 故此处不再强制自动归位，避免覆盖操作者意图。
                 if not events["stop_recording"]:
                     log_say(
-                        "Returning to home position",
+                        "Press A to home the arm before next episode",
                         cfg.play_sounds, voice=cfg.tts_voice, rate=cfg.tts_rate,
                     )
-                    robot.move_to_home(speed_deg_s=30.0)
 
                 if events["rerecord_episode"]:
                     log_say(
@@ -1239,10 +1345,12 @@ def record(cfg: RecordConfig) -> sLerobotDataset:
                     )
                     events["rerecord_episode"] = False
                     events["exit_early"]       = False
-                    dataset.clear_episode_buffer()
+                    if dataset is not None:
+                        dataset.clear_episode_buffer()
                     continue
 
-                dataset.save_episode()
+                if dataset is not None:
+                    dataset.save_episode()
                 recorded_episodes += 1
 
     finally:

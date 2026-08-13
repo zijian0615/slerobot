@@ -13,8 +13,9 @@ class XArmConfig(RobotConfig):
     xArm 机器人配置，支持 xArm5/6/7 系列，兼容多种夹爪类型。
 
     robot_mode:
-        6  -> 关节伺服模式（joint servo，低延迟，适合遥操作）
-        7  -> 笛卡尔在线轨迹规划模式（cartesian online trajectory planning，默认）
+        1  -> 笛卡尔离线 (default)
+        6  -> 关节在线伺服模式（joint online servo）
+        7  -> 笛卡尔在线轨迹规划模式（cartesian online trajectory planning）
 
     gripper_type:
         0  -> 无夹爪
@@ -32,7 +33,7 @@ class XArmConfig(RobotConfig):
     robot_dof: int = 6  # 5, 6, or 7
 
     # ---- 运动模式 ----
-    robot_mode: int = 6  # 6: joint servo, 7: cartesian online
+    robot_mode: int = 1  # 1: cartesian offline, 6: joint online, 7: cartesian online
 
     # ---- 速度 / 加速度 ----
     # mode=6 时单位为 rad/s（内部由 deg 转换），mode=7 时单位为 mm/s
@@ -46,7 +47,7 @@ class XArmConfig(RobotConfig):
     gripper_force: int = -1           # -1 表示自动
 
     # ---- 初始关节角 (radians) ----
-    start_joints: Tuple[float, ...] = (0.0, 0.0, -1.5708, 0.0, 1.5708, 0.0)
+    start_joints: Tuple[float, ...] = (-0.16828, -0.44685, -0.89340, -0.15272, 1.34873, -0.03999)
 
     # ---- 连接时是否自动运动到初始关节角 ----
     # 设为 False 可防止 connect() 时机械臂意外移动；
